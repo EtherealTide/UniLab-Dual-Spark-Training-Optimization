@@ -36,7 +36,7 @@ git -C unilab_rl write-tree  # c55bfad35393d05be90077a6023581cdfa80abc3
 误当作最终版本。修正版 patch 起点仍是用户指定的 dual-spark pin：
 
 - UniLab: `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` → tree
-  `ee4370191076018ff7822574f7eb4db8671d7d02`
+  `dc2eb96a224881955e7d8dad7ee6f2a9ba787b4e`
 - unilab-rl: `a3ed997d5c25ff708d674778782bc1be08a53e15` → tree
   `c55bfad35393d05be90077a6023581cdfa80abc3`
 
@@ -45,7 +45,7 @@ git -C unilab_rl write-tree  # c55bfad35393d05be90077a6023581cdfa80abc3
 ```bash
 git -C UniLab checkout d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3
 git -C UniLab apply ../patches/torchenv-selectable/UniLab/0001-dual-spark-torchenv-selectable.patch
-git -C UniLab write-tree  # ee4370191076018ff7822574f7eb4db8671d7d02
+git -C UniLab write-tree  # dc2eb96a224881955e7d8dad7ee6f2a9ba787b4e
 
 git -C unilab_rl checkout a3ed997d5c25ff708d674778782bc1be08a53e15
 git -C unilab_rl apply ../patches/torchenv-selectable/unilab_rl/0001-dual-spark-tensor-runtime.patch
