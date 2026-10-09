@@ -1,54 +1,59 @@
-# UniLab 双 DGX Spark 训练优化报告
+# Dual-DGX-Spark Training: Optimization and Measurements
 
-日期：2026-10-08
+Experiment date: 2026-10-08. Interpretation and reproduction instructions updated: 2026-10-09.
 
-> **Interpretation update (2026-10-09):** The tables report weak scaling within
-> the optimized runtime. Historical off-policy iteration-time ratios include
-> runtime and workload changes and are not isolated optimization gains. PPO
-> dual-node absolute throughput changes by +2.39%, +4.07%, +0.93%, and -1.33%
-> versus September. Read the [comparison audit](historical_comparison_2026-10.md)
-> before drawing a code-performance or convergence conclusion. Original exported
-> measurements are retained unchanged.
+This report covers PPO, SAC, and FlashSAC training with MuJoCo on two NVIDIA
+DGX Spark hosts, each with one GPU. The workloads include G1 locomotion and
+motion tracking, Go2 joystick control, and Allegro in-hand manipulation.
 
-范围：PPO、SAC、FlashSAC；MuJoCo；G1 locomotion / motion tracking、Go2 joystick、
-Allegro in-hand；2 × NVIDIA DGX Spark（每机单卡）。
+The tables measure weak scaling within the October runtime. Historical
+off-policy comparisons include changes to the runtime and workload, so their
+iteration-time ratios do not isolate the effect of the optimization patch.
+PPO dual-node throughput differs from September by +2.39%, +4.07%, +0.93%, and
+-1.33% across the four tasks. See the
+[historical comparison](historical_comparison_2026-10.md) for the baseline
+differences. The exported measurements have not been changed.
 
-版本基线：UniLab `feat/dual-spark@d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3`；
-unilab-rl `feat/dual-spark@a3ed997d5c25ff708d674778782bc1be08a53e15`；UniSim
-`v1.7.4@b48e91bbc62603299580a951c142a13c33bedae9`。实验优化代码由这些 pin
-按复现仓库中的顺序 patch 构造。
+The public source pins are:
 
-## 1. 优化目标和验收口径
+- UniLab: `feat/dual-spark@d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3`.
+- unilab-rl: `feat/dual-spark@a3ed997d5c25ff708d674778782bc1be08a53e15`.
+- UniSim: `v1.7.4@b48e91bbc62603299580a951c142a13c33bedae9`.
 
-目标不是只优化 `g1_walk_flat`，而是在 2026-09 报告的全任务矩阵上验证优化
-是否具有普适性。正式矩阵包括：
+The reproduction bundle applies its ordered patches to these pins to rebuild
+the experiment code.
 
-- PPO：`g1_walk_flat`、`g1_flip_tracking`、`go2_joystick_flat`、
-  `allegro_inhand`；
-- SAC：`g1_walk_flat`、`g1_motion_tracking`；
-- FlashSAC：`g1_walk_flat`、`g1_motion_tracking`。
+## 1. Workloads and measurement method
 
-每个负载都新跑一次单机 500 轮和双机 500 轮，共 16 个正式 run。统计口径：
+The test matrix covers the tasks in the September report:
 
-- 性能：iteration 50–499（450 个样本）的均值；
-- 质量：末 20 条 TensorBoard 记录平均；
-- PPO 和 off-policy 均报全局 env steps/s；
-- off-policy 额外报 learner rows/s；
-- 双机每 rank 保持单机相同规模，因此每 iteration 全局样本数翻倍。
+- PPO: `g1_walk_flat`, `g1_flip_tracking`, `go2_joystick_flat`, and `allegro_inhand`.
+- SAC: `g1_walk_flat` and `g1_motion_tracking`.
+- FlashSAC: `g1_walk_flat` and `g1_motion_tracking`.
 
-PPO summary 中的 `completed_iterations=499` 使用 0-based 编号；16 个正式 run 的
-TensorBoard `Perf/total_fps` 均核对为 500 条，不是少跑一轮。
+Each workload has one single-node run and one dual-node run of 500 iterations:
+16 runs in total. Throughput is the mean of iterations 50-499, after excluding
+the first 50 iterations. Reward and episode length are the means of the last
+20 TensorBoard records.
 
-off-policy 默认负载统一为每 rank `num_envs=2048`、`batch_size=8192`、
-`updates_per_step=8`、`policy_frequency=4`，即每轮 8 次 critic 和 2 次 actor update。
+PPO and off-policy throughput use global environment steps/s. Off-policy
+tables also report global learner rows/s. Each rank retains the single-node
+environment and batch sizes, so a dual-node iteration processes twice the
+global samples. The dual/single throughput ratio is a weak-scaling ratio.
 
-## 2. 起点瓶颈
+PPO's `completed_iterations=499` is a zero-based index. All 16 runs contain
+500 TensorBoard `Perf/total_fps` records.
 
-2026-09 版本已实现数学正确的外部 DP，但有三个性能瓶颈。
+The off-policy workload uses these per-rank settings:
+`num_envs=2048`, `batch_size=8192`, `updates_per_step=8`, and
+`policy_frequency=4`. Each iteration performs eight critic updates and two
+actor updates.
 
-### 2.1 传输层仍使用 TCP 兼容配置
+## 2. Bottlenecks in the earlier configuration
 
-旧启动配置强制：
+### 2.1 NCCL transport
+
+The earlier launch profile set:
 
 ```bash
 NCCL_IB_DISABLE=1
@@ -56,202 +61,215 @@ NCCL_P2P_DISABLE=1
 NCCL_SHM_DISABLE=1
 ```
 
-虽然两台 Spark 的 200 Gb/s RoCE HCA `rocep1s0f1` 处于 active 状态，NCCL 仍走 socket
-路径。FlashSAC 旧配置每轮 10 次 collective 约需 43.36 ms。
+NCCL used sockets despite an active 200 Gb/s RoCE HCA, `rocep1s0f1`.
+A FlashSAC diagnostic run reported about 43.36 ms for ten collectives per
+iteration. The timing estimator for that value was not recorded.
 
-### 2.2 FlashSAC whole-cycle CUDA Graph 与 DP 互斥
+### 2.2 FlashSAC CUDA Graph support
 
-FlashSAC 的 NVIDIA 高速路径原先会直接拒绝 DP callback，导致双机时不能同时享受
-whole-cycle CUDA Graph 的绝对性能。
+The earlier FlashSAC NVIDIA fast path rejected the distributed gradient
+callback. Dual-node training therefore could not use the same whole-cycle
+CUDA Graph path as single-node training.
 
-### 2.3 频繁 pack/unpack 和过多 collective
+### 2.3 Gradient copies and collective count
 
-每次 optimizer update 都要把所有参数梯度复制到 flat buffer，all-reduce 后再拷回。
-SAC 默认每轮有 18 次同步；FlashSAC 有 12 次。对 50–90 ms 的轻量 learner，
-这些固定成本足以主导扩展效率。
+Each optimizer update copied parameter gradients into a flat buffer, reduced
+that buffer, and copied the result back. The earlier update paths used
+18 synchronization calls per SAC iteration and 12 per FlashSAC iteration.
+These costs matter for learners whose iterations take roughly 50-90 ms.
 
-## 3. 具体优化及原因
+## 3. Implementation changes
 
-### 3.1 显式 RoCE 传输配置
+### 3.1 Explicit RoCE configuration
 
-UniLab `scripts/launch_distributed.py` 新增：
+UniLab's `scripts/launch_distributed.py` adds:
 
-- `--nccl-transport {tcp,auto,ib}`；
-- `--nccl-ib-hca`；
-- `ib` 模式设置 `NCCL_IB_DISABLE=0`、`NCCL_IB_HCA=rocep1s0f1`；
-- 验证拓扑中显式设置 `NCCL_P2P_DISABLE=0`、`NCCL_SHM_DISABLE=0`；
-- `tcp` 保留为兼容默认值。
+- `--nccl-transport {tcp,auto,ib}` and `--nccl-ib-hca`.
+- `NCCL_IB_DISABLE=0` and `NCCL_IB_HCA=rocep1s0f1` in the tested IB profile.
+- `NCCL_P2P_DISABLE=0` and `NCCL_SHM_DISABLE=0` for the tested topology.
+- TCP as the default compatibility profile.
 
-`DpParameterSync.start()` 也改为只对单机 FileStore 路径默认禁用 P2P/SHM，
-多节点 TCPStore 不再库内强制关闭。
+`DpParameterSync.start()` now defaults to disabling P2P/SHM only for the
+single-host FileStore path. It no longer forces those settings for a multi-node
+TCPStore. Each Spark has one GPU; there is no local multi-GPU peer connection
+in this topology. The transport diagnostics below changed IB, P2P, and SHM
+together and do not isolate the contribution of each setting.
 
-**原因**：每节点只有一块 GPU，没有需要回避的本地多 GPU peer edge。保留兼容开关
-只会让跨节点 collective 走慢路径。
+### 3.2 NCCL in the FlashSAC graph cycle
 
-### 3.2 FlashSAC 整周期 graph 内 NCCL
+Graph warmup, capture, and replay hooks allow FlashSAC to capture all-reduce
+operations as CUDA Graph nodes. Collective accounting runs before replay.
+Capture failures retain the eager fallback.
 
-为 FlashSAC 实现 graph warmup/capture/replay lifecycle hooks，把 all-reduce 作为 CUDA Graph
-节点捕获，并在 replay 前统计 collective。graph capture 失败时仍保留 eager fallback。
+Synchronization also carries finite-loss sentinels. If any rank reports a
+non-finite loss, the corresponding optimizer skips its update on all ranks.
+This keeps optimizer gating consistent across ranks.
 
-为了保持 NaN/Inf 安全性，同步额外携带 finite-loss sentinel。任意 rank 报告非有限
-时，对应 optimizer 在所有 rank 同步 skip，避免参数分歧。
+### 3.3 Persistent gradient bucket views
 
-**原因**：单机 FlashSAC 的主要加速来自 whole-cycle graph。双机如果退回 eager，即使
-网络足够快，也不可能接近单机两倍。
+CUDA Graph replay requires stable gradient storage addresses. During graph
+warmup, the DP layer binds each parameter's `.grad` to a non-overlapping view
+of the flat collective buffer. Later backward passes write directly to that
+buffer, and replay reduces it in place, avoiding per-parameter packing and
+unpacking.
 
-### 3.3 持久 flat gradient bucket view
+The eager compatibility path still copies gradients. Finite-loss sentinels
+remain copy-only so a scalar cannot alias multiple buckets. The September
+report attributed roughly 20-26 ms/iteration to the DP wrapper, gradient packing,
+and disruption of the asynchronous pipeline; storage reuse targets those costs.
 
-CUDA Graph 要求 gradient storage 地址稳定。在 graph warmup 时，DP 层把每个参数的
-`.grad` 绑定到 flat collective buffer 的不重叠 view。后续 backward 直接写入同一
-buffer，replay 时就地 all-reduce，不再做逐参数 pack/unpack。
+### 3.4 Collective fusion
 
-eager 兼容路径仍使用 copy。finite sentinel 明确标记为 copy-only，避免一个标量同时
-别名到多个 bucket。
+For the tested update schedule:
 
-**原因**：旧报告将约 20–26 ms/iter 归因于 DP wrapper、梯度打包以及通信对
-异步流水线的打断。直接复用 gradient storage 是消除这部分开销的关键。
+- SAC combines critic and alpha gradients: 18 to 10 collectives/iteration.
+- FlashSAC combines actor and temperature gradients: 12 to 10 collectives/iteration.
+- Each optimizer retains its own finite-loss sentinel and step gate.
 
-### 3.4 合并数学独立的 collective
+The combined parameter groups have independent losses and optimizers. Combining
+their transport reduces collective boundaries without changing the gradients
+being averaged.
 
-- SAC：critic + alpha 梯度合并，18 次降至 10 次/iter；
-- FlashSAC：actor + temperature 梯度合并，12 次降至 10 次/iter；
-- 每个 optimizer 保留独立 finite sentinel 和 step gate。
+## 4. Diagnostic comparisons
 
-**原因**：这些参数集的 loss 和 optimizer 数学独立，合并传输不改变梯度值，
-但可以减少高延迟的跨机 collective 边界。
+### 4.1 Transport
 
-## 4. 单项 A/B 证据
-
-### 4.1 传输层
-
-| FlashSAC 配置 | collective | DP sync | iteration | 全局 env steps/s |
+| FlashSAC configuration | Collectives/iteration | DP sync time | Iteration time | Global env steps/s |
 | --- | ---: | ---: | ---: | ---: |
-| TCP，IB/P2P/SHM 禁用 | 10 | 43.36 ms | ~279.15 ms | ~14.67k |
-| RoCE，P2P/SHM 开启 | 10 | 11.43 ms 中位数 | 248.16 ms | 16.54k |
+| TCP; IB/P2P/SHM disabled | 10 | 43.36 ms | ~279.15 ms | ~14.67k |
+| RoCE; P2P/SHM enabled | 10 | 11.43 ms median | 248.16 ms | 16.54k |
 
-These author-reported diagnostic observations change IB/P2P/SHM together.
-The old row does not specify its timing estimator, while 11.43 ms is a median;
-the previously stated 73.6% reduction is therefore not a verified like-for-like
-statistic. Raw A/B artifacts are not included in this bundle. Reported NCCL
-diagnostics show `NET/IB`, `rocep1s0f1`, 200000 Mb/s and `GDR 0`.
+These are author-reported diagnostic observations. The first row has no stated
+timing estimator; the second uses a median. Their ratio is not a verified
+percentage reduction. Raw A/B artifacts are not included in the bundle.
+Reported NCCL diagnostics show `NET/IB`, `rocep1s0f1`, 200000 Mb/s, and `GDR 0`.
 
-### 4.2 SAC collective 融合
+### 4.2 SAC collective fusion
 
-| 版本 | iter 50–299 | env steps/s | collective/iter |
+| Configuration | Mean iteration time, 50-299 | Env steps/s | Collectives/iteration |
 | --- | ---: | ---: | ---: |
-| 未融合 | 65.57 ms | 62.74k | 18 |
-| critic + alpha 融合 | 64.37 ms | 63.85k | 10 |
+| Separate collectives | 65.57 ms | 62.74k | 18 |
+| Fused critic + alpha | 64.37 ms | 63.85k | 10 |
 
-The point observations differ by about 1.8%. This diagnostic A/B used a
-250-iteration steady window, but the raw artifacts and repeat-run uncertainty
-are not bundled; it does not establish a reproducible isolated gain yet.
+The observations differ by about 1.8% over a 250-iteration window. The raw
+artifacts and uncertainty across repeated runs are not bundled, so this remains
+a diagnostic result rather than a demonstrated repeatable gain.
 
-### 4.3 绝对性能
+### 4.3 Historical iteration times
 
-| 负载 | 2026-09 单机 | 当前单机 | 2026-09 双机 | 当前双机 |
+| Workload | September single-node | October single-node | September dual-node | October dual-node |
 | --- | ---: | ---: | ---: | ---: |
 | SAC g1_walk_flat | 91.0 ms | 53.22 ms | 127.9 ms | 64.19 ms |
 | SAC g1_motion_tracking | 64.5 ms | 72.00 ms | 92.0 ms | 80.01 ms |
 | FlashSAC g1_walk_flat | 901.4 ms | 234.27 ms | 945.4 ms | 249.18 ms |
 | FlashSAC g1_motion_tracking | 471.2 ms | 245.13 ms | 494.7 ms | 260.43 ms |
 
-The historical FlashSAC iteration-time ratios are about 1.9-3.8x, across changed
-runtime and workload configurations. FlashSAC walk changes from 4096 to 2048
-environments per rank, and update schedules require historical resolved configs
-for confirmation. These ratios cannot be attributed entirely to RoCE/DP.
-See the comparison audit for the separate integration patch and metric units.
+FlashSAC's historical iteration-time ratios are about 1.9-3.8x. They span
+different runtimes and workloads: FlashSAC walk changes from 4096 to 2048
+environments per rank, and the historical resolved update schedules are missing.
+The full reduction cannot be attributed to RoCE or DP changes. The
+[comparison report](historical_comparison_2026-10.md) separates these issues
+from the October scaling measurements.
 
-## 5. 500 轮全任务实测
+## 5. Results from the 500-iteration matrix
 
 ### 5.1 PPO
 
-| 任务 | 每节点 env | 单机 | 双机 | 加速 | 与旧报告 |
+Throughput is global environment steps/s.
+
+| Task | Envs/rank | Single-node | Dual-node | October scaling | September scaling |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| g1_walk_flat | 2048 | 49.16k | 83.57k | **1.70×** | 1.87× |
-| g1_flip_tracking | 1024 | 22.86k | 43.04k | **1.88×** | 1.78× |
-| go2_joystick_flat | 2048 | 66.81k | 133.75k | **2.00×** | 1.93× |
-| allegro_inhand | 16384 | 42.64k | 91.44k | **2.14×** | 1.97× |
+| g1_walk_flat | 2048 | 49.16k | 83.57k | 1.70× | 1.87× |
+| g1_flip_tracking | 1024 | 22.86k | 43.04k | 1.88× | 1.78× |
+| go2_joystick_flat | 2048 | 66.81k | 133.75k | 2.00× | 1.93× |
+| allegro_inhand | 16384 | 42.64k | 91.44k | 2.14× | 1.97× |
 
-Go2 的单/双机尾部 episode length 都是 1000，环境状态分布高度一致，实测达到
-2.00×。G1 walk 在 500 轮时双机已进入长 episode 阶段（尾部 890 vs 单机 77），
-两侧真实仿真工作负载不再同构，因此全窗口为 1.70×，低于早期 200 轮窗口的
-1.98×。Allegro 的双机 reward/episode length 为 11.74/399.63，单机为
-3.10/133.85；双机 collection 反而从 2738.69 ms 降至 2402.34 ms，最终得到
-2.14×。这是真实训练 benchmark 的状态反馈：Allegro 的超线性数值包含策略阶段和
-环境状态分布贡献，不能解释为硬件本身超过 2×；同理也不应通过挑选早期窗口隐藏
-G1 walk 的 1.70×。
+Go2's final episode length is 1000 on both single and dual nodes, with a measured
+ratio of 2.00×. G1 walk reaches different policy stages: final episode length is
+about 890 on two nodes versus 77 on one. The resulting simulation workloads
+differ, and the 500-iteration ratio is 1.70×, below the earlier 200-iteration
+observation of 1.98×.
 
-### 5.2 off-policy
+Allegro's dual-node reward/episode length is 11.74/399.63, versus 3.10/133.85
+on one node. Collection time falls from 2738.69 to 2402.34 ms. Its 2.14× ratio
+therefore includes changes in policy stage and environment state distribution;
+it is not a hardware-only superlinear result. The report keeps the full window
+for all tasks, including G1 walk's lower ratio.
 
-| 负载 | 单机 iter | 双机 iter | 单机 env steps/s | 双机 env steps/s | 加速 |
+### 5.2 SAC and FlashSAC
+
+| Workload | Single-node iteration | Dual-node iteration | Single-node env steps/s | Dual-node env steps/s | Scaling |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| SAC g1_walk_flat | 53.22 ms | 64.19 ms | 38.50k | 64.02k | **1.66×** |
-| SAC g1_motion_tracking | 72.00 ms | 80.01 ms | 28.47k | 51.32k | **1.80×** |
-| FlashSAC g1_walk_flat | 234.27 ms | 249.18 ms | 8.74k | 16.47k | **1.88×** |
-| FlashSAC g1_motion_tracking | 245.13 ms | 260.43 ms | 8.36k | 15.76k | **1.89×** |
+| SAC g1_walk_flat | 53.22 ms | 64.19 ms | 38.50k | 64.02k | 1.66× |
+| SAC g1_motion_tracking | 72.00 ms | 80.01 ms | 28.47k | 51.32k | 1.80× |
+| FlashSAC g1_walk_flat | 234.27 ms | 249.18 ms | 8.74k | 16.47k | 1.88× |
+| FlashSAC g1_motion_tracking | 245.13 ms | 260.43 ms | 8.36k | 15.76k | 1.89× |
 
-| 负载 | 单机 learner rows/s | 双机 learner rows/s | 加速 |
+| Workload | Single-node learner rows/s | Dual-node learner rows/s | Scaling |
 | --- | ---: | ---: | ---: |
 | SAC g1_walk_flat | 1,231,354 | 2,041,779 | 1.66× |
 | SAC g1_motion_tracking | 910,271 | 1,638,196 | 1.80× |
 | FlashSAC g1_walk_flat | 279,748 | 526,023 | 1.88× |
 | FlashSAC g1_motion_tracking | 267,349 | 503,298 | 1.88× |
 
-两个 FlashSAC 任务都在 1.88–1.89×，证明近线性扩展不是 `g1_walk_flat`
-特例。SAC motion 比 walk 更重，固定通信成本占比更小，因此扩展率从 1.66×
-上升到 1.80×。
+Both FlashSAC tasks record 1.88-1.89× environment throughput. SAC motion has a
+longer single-node iteration than SAC walk, so the added synchronization cost
+takes a smaller share of the iteration; its ratio is 1.80× versus 1.66×.
 
-## 6. 为什么不是所有负载都达到 2×
+## 6. Compute and communication costs
 
-设单机每轮时间为 `T`，双机的额外通信/同步成本为 `C`，每轮全局样本数翻倍，
-则理想扩展约为 `2T / (T + C)`。
+If single-node iteration time is `T` and dual-node execution adds `C`, doubling
+the global samples gives an approximate throughput ratio of `2T / (T + C)`:
 
-- FlashSAC walk：`T=234.27 ms`，`C=14.91 ms`，理论/​实测均约 1.88×；
-- SAC walk：`T=53.22 ms`，`C=10.97 ms`，只有约 1.66×；
-- SAC motion：`T=72.00 ms`，`C=8.01 ms`，上升到 1.80×；
-- PPO 除了 DDP learner 成本，还受策略进化导致的 reset 频率、episode length 和任务
-  manager 工作量变化影响。
+- FlashSAC walk: `T=234.27 ms`, `C=14.91 ms`, ratio about 1.88×.
+- SAC walk: `T=53.22 ms`, `C=10.97 ms`, ratio about 1.66×.
+- SAC motion: `T=72.00 ms`, `C=8.01 ms`, ratio about 1.80×.
 
-因此“总吞吐接近两倍”的前提是 `C/T` 足够小，不是单纯把网卡换成 200 Gb/s。
+This model assumes comparable work on each rank. PPO also depends on reset
+frequency, episode length, and task-manager work as the policy changes.
+A fast network alone does not make `C/T` small.
 
-## 7. 训练质量
+## 7. Training metrics
 
-| 算法/任务 | 单机 reward / ep len | 双机 reward / ep len | 解读 |
+| Algorithm/task | Single-node reward / episode length | Dual-node reward / episode length | Observation |
 | --- | ---: | ---: | --- |
-| PPO g1_walk_flat | 1.02 / 76.70 | 25.04 / 890.35 | 双机每轮全局样本翻倍，学习阶段显著超前 |
-| PPO g1_flip_tracking | 22.09 / 190.72 | 19.22 / 141.28 | 双机略低，但无发散；500 轮不足以判定收敛等价 |
+| PPO g1_walk_flat | 1.02 / 76.70 | 25.04 / 890.35 | Different policy stages; dual nodes collect twice the samples per iteration |
+| PPO g1_flip_tracking | 22.09 / 190.72 | 19.22 / 141.28 | Lower dual-node metrics; no reported divergence |
 | PPO go2_joystick_flat | 53.38 / 1000 | 54.01 / 1000 | Similar short-run metrics |
-| PPO allegro_inhand | 3.10 / 133.85 | 11.74 / 399.63 | 双机每轮样本翻倍，学习阶段显著超前 |
+| PPO allegro_inhand | 3.10 / 133.85 | 11.74 / 399.63 | Different policy stages; dual nodes collect twice the samples per iteration |
 | SAC g1_walk_flat | 16.91 / 67.67 | 17.22 / 70.02 | Similar short-run metrics |
-| SAC g1_motion_tracking | -0.034 / 32.44 | -0.073 / 33.94 | 同一早期学习区间 |
+| SAC g1_motion_tracking | -0.034 / 32.44 | -0.073 / 33.94 | Both runs remain in early learning |
 | FlashSAC g1_walk_flat | 4.45 / 47.87 | 4.14 / 48.30 | Similar short-run metrics |
 | FlashSAC g1_motion_tracking | 1.13 / 36.99 | 1.14 / 37.89 | Similar short-run metrics |
 
-These 500-iteration observations show no reported instability in the measured
-runs. Similar short-run rewards do not establish learning or convergence
-equivalence. Multiple seeds and matched sample budgets are needed, especially
-when PPO single/dual policies enter different learning stages.
+No instability was reported in these runs. The short-run metrics do not
+establish convergence equivalence. That comparison requires multiple seeds,
+longer runs, and matched sample budgets, particularly where single- and dual-node
+PPO policies reach different stages.
 
-## 8. 失败实验和有限收益
+## 8. Other experiments and toolchain issues
 
-1. **RoCE 但继续禁用 P2P/SHM**：FlashSAC 短测约 259 ms/iter，优于旧 TCP，
-   但不如 RoCE + P2P/SHM 开启的 248 ms。
-2. **SAC collective 融合的短测**：30 轮无法观察收益；300 轮固定窗口才确认
-   +1.8%。这说明冷启编译和 learning starts 会误导过短 A/B。
-3. **GDR 探测**：NCCL 已使用 IB，但仍报 `GDR 0`。`libmlx5` 缺少需要的 DMA-BUF
-   符号，`nvidia_peermem` 存在但未加载。本轮没有为追求最后几个百分点而修改
-   驱动/内核。
-4. **GB10 PTXAS**：GB10 是 compute capability 12.1，当前 Triton 捆绑 `ptxas` 最高
-   识别 12.0。首次 autotune 会输出 `sm_121a` 失败，随后回退/命中缓存并正常完成。
+1. RoCE with P2P/SHM still disabled recorded about 259 ms/iteration in a short
+   FlashSAC test, between the earlier TCP observation and the 248 ms observation
+   with P2P/SHM enabled. This is a combined-configuration diagnostic.
+2. A 30-iteration SAC fusion test showed no clear gain. The longer 300-iteration
+   test, using iterations 50-299, recorded the approximately 1.8% difference in
+   Section 4.2. Compilation and learning-start warmup affect short comparisons.
+3. NCCL reported IB transport but `GDR 0`. Diagnostics found missing DMA-BUF
+   symbols in `libmlx5`; `nvidia_peermem` was present but not loaded. The
+   experiment did not change the driver or kernel to pursue GDR.
+4. GB10 has compute capability 12.1, while the tested Triton `ptxas` recognized
+   up to 12.0. Initial autotuning emitted `sm_121a` failures, followed by fallback
+   or cache use and completed training.
 
-## 9. 复现
+## 9. Reproduction
 
-These commands target the current bootstrapped runtime on `HOST0`
-(`spark-0a2a`). Launch once from HOST0; the native launcher starts rank1 on
-`nvidia@192.168.110.40`. Both nodes must have the patched runtime at the same
-path and passwordless SSH from HOST0 to HOST1. The original experiment path
-`/home/nvidia/unilab-dual-spark-opt-20261008/UniLab` is historical provenance,
-not the current reproduction installation path.
+These commands use the bootstrapped runtime on `HOST0` (`spark-0a2a`). Launch
+once from HOST0; the native launcher starts rank1 on `nvidia@192.168.110.40`.
+Both hosts need the patched runtime at the same path and passwordless SSH from
+HOST0 to HOST1. The earlier path
+`/home/nvidia/unilab-dual-spark-opt-20261008/UniLab` identifies the original
+experiment installation, not the current reproduction directory.
 
 Prepare the shell on HOST0:
 
@@ -260,18 +278,17 @@ cd /home/nvidia/unilab-dual-spark-repro/UniLab
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Run one workload at a time and choose a free rendezvous port. Use a new run
-directory for every attempt; the current launcher rejects nonempty directories.
-`--no-sync` preserves the pinned editable dependencies installed by bootstrap.
-`++training.log_interval=1` explicitly requests every-iteration metrics needed
-for the report's 50-499 extraction window.
+Run one workload at a time with a free rendezvous port and a new run directory.
+The launcher rejects nonempty directories. `--no-sync` preserves the editable
+dependencies installed by bootstrap. `++training.log_interval=1` requests the
+per-iteration metrics used for the 50-499 measurement window.
 
 ### FlashSAC: dual node
 
-For the environment-variable + direct `train_sac.py`/`train_flashsac.py` style,
-see [Dual-node SAC: direct Hydra entrypoints](../README.md#dual-node-sac-direct-hydra-entrypoints).
-It requires one command on each host. The supervised examples below launch
-the peer automatically and preserve the same original off-policy Rich logger.
+For direct `train_sac.py` or `train_flashsac.py` commands, see
+[Dual-node SAC: direct Hydra entrypoints](../README.md#dual-node-sac-direct-hydra-entrypoints).
+That method requires a command on each host. The launcher below starts the peer
+and retains the original off-policy Rich logger.
 
 ```bash
 run_name="flashsac_dual_g1_walk_500_native_$(date +%Y%m%d_%H%M%S)"
@@ -289,12 +306,13 @@ PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \
 
 ### PPO: dual node
 
-The native launcher defaults to compact PPO console output: startup parameters,
-first/final progress, and periodic progress every 30 seconds. It prints the
-full-log `tail -n 40 -F ...` command at startup and final statistics at completion.
-Full RSL-RL output is preserved in the rank logs. Add `--ppo-console full` to
-restore the full console stream, or `--progress-interval 60` for less frequent
-progress. SAC/FlashSAC retain their original Rich Live panel.
+PPO defaults to compact console output: launch parameters, the first and final
+iterations, and progress at most every 30 seconds. At startup, the launcher
+prints a `tail -n 40 -F ...` command for the full log. It prints final statistics
+after all ranks complete. The rank logs retain the full RSL-RL output.
+
+Use `--ppo-console full` for the full console stream or `--progress-interval 60`
+for less frequent progress. SAC/FlashSAC retain their original Rich Live panel.
 
 ```bash
 run_name="ppo_dual_go2_500_native_$(date +%Y%m%d_%H%M%S)"
@@ -308,8 +326,9 @@ PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \
   algo.num_envs=2048 algo.max_iterations=500 ++training.log_interval=1
 ```
 
-For a functional smoke test, use `algo.max_iterations=2` and a fresh run name;
-smoke throughput is not a benchmark. Full rank logs are saved automatically:
+For a functional smoke test, use `algo.max_iterations=2` and a fresh run name.
+Do not use smoke-test throughput as a benchmark. Full rank logs are saved
+automatically:
 
 ```bash
 # Run in another terminal on HOST0, replacing the name with the printed run name.
@@ -317,27 +336,29 @@ tail -n 40 -F "logs/<run_name>/launcher/rank0.log"
 tail -n 40 -F "logs/<run_name>/launcher/rank1.log"
 ```
 
-Rank0 is the only TensorBoard/checkpoint writer. Final statistics print after
-all ranks succeed and the completed summary is verified. Use the fixed-window
-extractor for report comparisons; update its manifest to the timestamped run
-name. The full-training PPO average and off-policy final-iteration statistics
-printed at completion are different estimators from the report tables.
+Rank0 is the only TensorBoard/checkpoint writer. Final statistics require
+successful exits from all ranks and a verified completed summary. For report
+comparisons, use the fixed-window extractor and update its manifest with the
+new run name. The launcher's full-training PPO average and off-policy
+final-iteration rates use different windows from the tables in this report.
 
-## 10. 工程验证和结论
+## 10. Validation and remaining work
 
-- uni_rl CPU-safe focused suite：57 passed, 20 skipped, 1 deselected；
-- UniLab RoCE launcher：4 passed；
-- Ruff、`git diff --check` 通过；
-- 16 个正式 500 轮 run 使用独立日志目录和 checkpoint；
-- off-policy 所有双机运行均为 10 collective/iteration，无 NaN/Inf 或 rank 分歧。
+Validation recorded for the experiment code:
 
-结论：
+- uni_rl CPU-safe focused suite: 57 passed, 20 skipped, 1 deselected.
+- UniLab RoCE launcher tests: 4 passed.
+- Ruff and `git diff --check`: passed.
+- All 16 runs used separate log directories and checkpoints.
+- The tested off-policy dual-node runs recorded ten collectives per iteration,
+  with no reported NaN/Inf failure or rank divergence.
 
-1. The optimized configuration records 1.88-1.89x FlashSAC weak scaling across
-   walk/motion. Historical iteration-time reductions also include runtime and
-   workload changes; this report does not isolate a 1.9-3.8x optimization gain.
-2. SAC 的扩展率从 walk 的 1.66× 到 motion 的 1.80×，清晰验证了计算/通信比模型。
-3. PPO 在状态分布匹配的 Go2 上达到 2.00×；G1 walk 的 500 轮真实训练受
-   策略阶段差异影响，全窗口为 1.70×。
-4. 若要让轻量 SAC 从 1.66× 继续接近 2×，需要减少 optimizer synchronization
-   boundary、启用真正 GDR，或提高 learner 计算重量。前两者需要新的稳定性/收敛对照。
+The matrix records FlashSAC weak scaling of 1.88-1.89× and SAC ratios of
+1.66× for walk and 1.80× for motion. PPO ranges from 1.70× to 2.14×, with policy
+and simulation-work differences affecting the comparison. Historical FlashSAC
+iteration-time reductions also include runtime integration and workload changes.
+
+Further SAC scaling would require fewer optimizer synchronization boundaries,
+working GDR, or more learner work per synchronization. Changes to the update
+schedule require separate stability and convergence tests; GDR requires a
+validated driver/network configuration.
