@@ -61,14 +61,14 @@ clone_if_missing "$UNILAB_REPO" "$target_root/UniLab"
 apply_pinned_patches \
     "$target_root/UniLab" \
     "$UNILAB_BRANCH_COMMIT" \
-    "$UNILAB_OPT_TREE" \
+    "$UNILAB_INTEGRATION_TREE" \
     "$bundle_root/patches/UniLab"
 
 clone_if_missing "$UNILAB_RL_REPO" "$target_root/unilab_rl"
 apply_pinned_patches \
     "$target_root/unilab_rl" \
     "$UNILAB_RL_BRANCH_COMMIT" \
-    "$UNILAB_RL_OPT_TREE" \
+    "$UNILAB_RL_INTEGRATION_TREE" \
     "$bundle_root/patches/unilab_rl"
 
 clone_if_missing "$UNISIM_REPO" "$target_root/UniSim"

@@ -1,8 +1,8 @@
 # UniLab Dual-Spark Training Optimization
 
 两台 NVIDIA DGX Spark（每机单卡、200 Gb/s QSFP 直连）上的 UniLab 多节点训练优化、
-完整 500 轮实验矩阵与可复现交付。覆盖 PPO、SAC、FlashSAC，以及 G1 locomotion / motion
-tracking、Go2 joystick 和 Allegro in-hand MuJoCo 任务。
+TorchEnv 主线合入 dual-spark 后的集成、500 轮实验矩阵与可复现交付。覆盖 PPO、SAC、
+FlashSAC，以及当前主线仍保留的 G1 locomotion / motion tracking、Go2 joystick MuJoCo 任务。
 
 ## 结果先看：绝对吞吐
 
@@ -14,12 +14,9 @@ tracking、Go2 joystick 和 Allegro in-hand MuJoCo 任务。
 | 任务 | 每节点 env | 单机 steps/s | 双机总 steps/s | 加速比 |
 | --- | ---: | ---: | ---: | ---: |
 | `g1_walk_flat` | 2,048 | 49,160.65 | **83,567.30** | 1.70× |
-| `g1_flip_tracking` | 1,024 | 22,861.84 | **43,038.46** | 1.88× |
 | `go2_joystick_flat` | 2,048 | 66,808.68 | **133,751.39** | 2.00× |
-| `allegro_inhand` | 16,384 | 42,643.60 | **91,439.72** | 2.14×* |
-
-\* Allegro 双机在 500 轮内进入了更晚的策略阶段，状态分布变化降低了 collection 时间；
-2.14×是端到端真实训练吞吐，不应解释为硬件本身的超线性扩展。
+`g1_flip_tracking` 和 `allegro_inhand` 已由 TorchEnv main 删除，不能在不恢复旧 Numpy
+owner 的前提下声称可比；它们在新报告中标记为 N/A。
 
 ### Off-policy：环境吞吐与 learner 吞吐
 
@@ -52,13 +49,13 @@ tracking、Go2 joystick 和 Allegro in-hand MuJoCo 任务。
 
 ## 精确版本锁定
 
-版本的机器可读定义在 [`versions.env`](versions.env)。实验使用：
+版本的机器可读定义在 [`versions.env`](versions.env)。TorchEnv 实验使用：
 
 | 项目 | 可复现版本 |
 | --- | --- |
-| UniLab | `feat/dual-spark` pin `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` + 本仓库 patch；实验优化 tree 对应提交 `139524ac893efecf76feaf827e7236cb77307b33`；包版本 `1.3.2` |
-| UniSim | tag `v1.7.4`，commit `b48e91bbc62603299580a951c142a13c33bedae9`，包版本 `unisim-core==1.7.4` |
-| unilab-rl | `feat/dual-spark` pin `a3ed997d5c25ff708d674778782bc1be08a53e15` + 测试时 main runtime 集成 patch + 优化 patch；实验优化 tree 对应提交 `385a69f6d74bcfd9453bd2ed0c2d0687ae6c5556` |
+| UniLab | dual pin `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` + TorchEnv main source `5c8877ec6ec1bb0aba5c7682d6efdaed43fd49ee` 合并；集成提交 `d71875c0dc2bf8a054514b69547502664eb7b2e0`；包版本 `1.3.3` |
+| UniSim | tag `v1.7.12`，commit `d082150631f16c8d3c8913281f62474cd9dffb93`，包版本 `unisim-core==1.7.12` |
+| unilab-rl | dual pin `a3ed997d5c25ff708d674778782bc1be08a53e15` + TorchEnv main source `8c5a322bac66d4e8150867f24913da3ab916dea3` 合并；集成提交 `a7f82c9476eaa61e97bf9ec6dd725f9a055ceb40`；包版本 `1.4.10` |
 | PyTorch | `2.9.0+cu130` |
 | MuJoCo | `3.11.0` |
 
@@ -120,8 +117,8 @@ bash scripts/bootstrap.sh /home/nvidia/unilab-dual-spark-repro
 
 1. 克隆三个上游仓库；
 2. checkout `versions.env` 中的 base commit；
-3. 对 UniLab 和 unilab-rl 应用本仓库 patch；
-4. checkout UniSim 1.7.4 对应 commit；
+3. 对 UniLab 和 unilab-rl 应用 TorchEnv 集成 patch；
+4. checkout UniSim 1.7.12 对应 commit；
 5. 用 UniLab 的 frozen lock 创建 `.venv`；
 6. 用精确源码覆盖安装 UniSim 和 unilab-rl；
 7. 验证 tree hash 和包版本。

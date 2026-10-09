@@ -1,0 +1,13 @@
+algo,task,mode,iterations,envs,batch_size,critic_updates,actor_updates,throughput_steps_s,status
+ppo,g1_walk_flat,single,500,2048,,,,,pending
+ppo,g1_walk_flat,dual,500,2048,,,,,pending
+ppo,go2_joystick_flat,single,500,2048,,,,52857.4578,complete
+ppo,go2_joystick_flat,dual,500,2048,,,,72317.1156,complete
+sac,g1_walk_flat,single,500,2048,8192,8,2,,pending
+sac,g1_walk_flat,dual,500,2048,8192,8,2,,pending
+sac,g1_motion_tracking,single,500,2048,8192,8,2,,pending
+sac,g1_motion_tracking,dual,500,2048,8192,8,2,,pending
+flashsac,g1_walk_flat,single,500,2048,8192,8,2,,pending
+flashsac,g1_walk_flat,dual,500,2048,8192,8,2,,pending
+flashsac,g1_motion_tracking,single,500,2048,8192,8,2,,pending
+flashsac,g1_motion_tracking,dual,500,2048,8192,8,2,,pending
