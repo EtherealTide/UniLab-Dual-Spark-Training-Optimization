@@ -29,3 +29,25 @@ git -C unilab_rl checkout a3ed997d5c25ff708d674778782bc1be08a53e15
 git -C unilab_rl apply ../patches/unilab_rl/0001-merge-torchenv-main-dual-spark.patch
 git -C unilab_rl write-tree  # c55bfad35393d05be90077a6023581cdfa80abc3
 ```
+
+## selectable TorchEnv 修正版
+
+本分支使用 `patches/torchenv-selectable/`，不要把历史 `0001-merge-torchenv-main-dual-spark.patch`
+误当作最终版本。修正版 patch 起点仍是用户指定的 dual-spark pin：
+
+- UniLab: `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` → tree
+  `ee4370191076018ff7822574f7eb4db8671d7d02`
+- unilab-rl: `a3ed997d5c25ff708d674778782bc1be08a53e15` → tree
+  `c55bfad35393d05be90077a6023581cdfa80abc3`
+
+验证命令：
+
+```bash
+git -C UniLab checkout d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3
+git -C UniLab apply ../patches/torchenv-selectable/UniLab/0001-dual-spark-torchenv-selectable.patch
+git -C UniLab write-tree  # ee4370191076018ff7822574f7eb4db8671d7d02
+
+git -C unilab_rl checkout a3ed997d5c25ff708d674778782bc1be08a53e15
+git -C unilab_rl apply ../patches/torchenv-selectable/unilab_rl/0001-dual-spark-tensor-runtime.patch
+git -C unilab_rl write-tree  # c55bfad35393d05be90077a6023581cdfa80abc3
+```
