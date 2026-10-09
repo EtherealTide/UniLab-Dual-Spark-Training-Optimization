@@ -268,6 +268,11 @@ for the report's 50-499 extraction window.
 
 ### FlashSAC: dual node
 
+For the environment-variable + direct `train_sac.py`/`train_flashsac.py` style,
+see [Dual-node SAC: direct Hydra entrypoints](../README.md#dual-node-sac-direct-hydra-entrypoints).
+It requires one command on each host. The supervised examples below launch
+the peer automatically and preserve the same original off-policy Rich logger.
+
 ```bash
 run_name="flashsac_dual_g1_walk_500_native_$(date +%Y%m%d_%H%M%S)"
 PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \

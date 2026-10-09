@@ -83,8 +83,8 @@ See the [historical comparison audit](reports/historical_comparison_2026-10.md).
 
 The measured experiment tree is preserved separately from
 `UNILAB_RUNTIME_TREE` in `versions.env`. The current runtime additionally applies
-UniLab patch `0003`: native launcher lifecycle/logging fixes and terminal Rich
-presentation. Those fixes were validated with short functional runs, not a new
+UniLab patch `0003`: native launcher lifecycle/logging fixes and preservation
+of the existing loggers' terminal output. These fixes were validated with short functional runs, not a new
 500-iteration performance matrix. Exported benchmark data remains unchanged.
 
 The public branch pins and actual experiment trees are recorded separately.
@@ -428,16 +428,74 @@ PYTHONUNBUFFERED=1 uv run --no-sync src/unilab/scripts/train_rsl_rl.py \
 ```
 
 Use `src/unilab/scripts/train_sac.py` or `train_flashsac.py` for off-policy
-training, with the matching task and batch/update overrides above. For dual-node
-training, use the UniLab launcher to supply the per-rank distributed settings.
+training, with the matching task and batch/update overrides above.
+
+### Dual-node SAC: direct Hydra entrypoints
+
+This form calls the existing UniLab training script directly, like the
+[single-host multi-card example](https://github.com/EtherealTide/UniLab-Multi-Card-Training-Optimization).
+For two Spark hosts, run it **once on each host**. Both GPUs are locally
+`cuda:0`; `training.devices=[0,1]` means two GPUs on one machine. External DP
+instead reads the world size, rank and rendezvous URL below.
+
+On **both nodes**, use the same fresh `run_name` and identical overrides. Set
+`rank=0` on HOST0 (`spark-0a2a`), and `rank=1` on HOST1 (`spark-7e93`). The
+example name must be changed for a subsequent attempt. Start both sessions
+within the rendezvous timeout.
+
+```bash
+cd /home/nvidia/unilab-dual-spark-repro/UniLab
+export PATH="$HOME/.local/bin:$PATH"
+run_name="sac_dual_g1_walk_500_direct_trial1"
+rank=0  # HOST0; use rank=1 on HOST1
+
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
+NCCL_SOCKET_IFNAME=enp1s0f1np1 NCCL_IB_DISABLE=0 NCCL_IB_HCA=rocep1s0f1 \
+NCCL_P2P_DISABLE=0 NCCL_SHM_DISABLE=0 \
+UNILAB_DP_EXTERNAL=1 UNILAB_DP_WORLD_SIZE=2 UNILAB_DP_RANK="$rank" \
+UNILAB_DP_RENDEZVOUS_URL=tcp://10.77.0.1:29700 \
+UNILAB_DP_LOG_DIR="logs/$run_name" \
+uvx uv@0.12.5 run --no-sync \
+  src/unilab/scripts/train_sac.py \
+  task=g1_walk_flat/mujoco training.devices=null \
+  algo.num_envs=2048 algo.batch_size=8192 \
+  algo.updates_per_step=8 algo.policy_frequency=4 algo.max_iterations=500 \
+  training.no_play=true training.trace_enabled=false ++training.log_interval=1
+```
+
+Port 29700 must be free on HOST0. `training.devices=null` leaves local device
+selection to the external-DP path; `CUDA_VISIBLE_DEVICES=0` exposes the one
+local GPU. Environment count and batch size remain **per rank**. `uvx` selects
+the uv executable version; `--no-sync` preserves the pinned training dependencies.
+Plain `uv run --no-sync` also works with the installed uv.
+
+For FlashSAC, change the entrypoint to `train_flashsac.py`, use a fresh run
+name/port, and keep both ranks' remaining configuration identical.
+PPO multi-node launch uses torchrun and its RSL-RL logger; this external-DP SAC
+command is not a PPO launch recipe.
+
+The interactive SAC/FlashSAC display is the existing
+`uni_rl.logging.OffPolicyLogger`: **UniLab Off-Policy Training**, Losses &
+Metrics, Rewards, Learner, Collector, System, and Training Summary. It is not a
+MuJoCo-specific logging backend. Rank0 renders/writes metrics and checkpoints;
+rank1 may remain quiet during successful training.
+
+Manual direct commands do not launch the peer or provide the native launcher's
+all-rank supervision, SSH lifetime lease, rank-log capture or peer cleanup.
+On failure/interruption, check and stop both matching sessions. To get automatic
+peer launch and saved logs with the same native Rich display, use the UniLab
+launcher examples above. Piping a direct command through `tee` removes its TTY
+and can disable live/color rendering; the native launcher preserves it through
+an isolated output PTY.
 
 ### Native-launcher output and statistics
 
 With UniLab patch `0003` applied **on both nodes**, these native commands print
-rank0 output and keep rank1 details in saved logs. PPO uses a Rich panel in an
-interactive terminal. Redirected output retains the upstream text format;
-`UNILAB_PPO_CONSOLE=rich` requests a panel without a terminal, and
-`UNILAB_PPO_CONSOLE=legacy` requests the original RSL-RL console format.
+rank0 output and keep rank1 details in saved logs. SAC/FlashSAC use their existing
+Rich Live panel and Training Summary in an interactive terminal. PPO retains
+the original RSL-RL logger. The launcher preserves rank0 TTY detection and width
+using an isolated output PTY, without replacing logger metrics/layouts.
+Redirected output uses the original logger's non-terminal behavior.
 The bundle launcher still defaults to compact output.
 
 The native launcher automatically saves full stdout/stderr, including SSH errors:
@@ -456,8 +514,9 @@ and returns failure. Ctrl+C also stops the groups owned by this launch.
 After the first successful rank exit, remaining ranks have 60 seconds to finish;
 use `--completion-timeout 120` when checkpoint shutdown needs longer.
 Successful completion requires every rank to exit successfully and a completed,
-matching `run_summary.json`. Final statistics print automatically, including
-PPO full-training throughput or off-policy final-iteration throughput.
+matching `run_summary.json`. Final statistics print automatically: the original
+off-policy Rich Training Summary remains intact, followed by all-rank completion
+confirmation; PPO prints its full-training statistics.
 These summary windows differ from the report's iterations 50-499.
 
 Use a fresh timestamped run name. A nonempty run directory is rejected.
