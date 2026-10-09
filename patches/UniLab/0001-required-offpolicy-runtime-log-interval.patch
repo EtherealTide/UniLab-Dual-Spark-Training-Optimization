@@ -1,0 +1,47 @@
+diff --git a/src/unilab/conf/flashsac/config.yaml b/src/unilab/conf/flashsac/config.yaml
+index b46dbae6..55818441 100644
+--- a/src/unilab/conf/flashsac/config.yaml
++++ b/src/unilab/conf/flashsac/config.yaml
+@@ -97,6 +97,9 @@ training:
+   trace_cuda_events: true
+   nvtx_profile_ranges: false
+   replay_prefetch_mode: one_tick
++  # Emit learner metrics every iteration. Required by unilab-rl >= 1.4 and
++  # kept explicit so older dual-Spark owner configs remain forward-compatible.
++  log_interval: 1
+   torch_threads:
+     enabled: true
+     # "auto" resolves per process role from host CPU count with conservative caps.
+diff --git a/src/unilab/conf/sac/config.yaml b/src/unilab/conf/sac/config.yaml
+index a0db693c..bd797fa3 100644
+--- a/src/unilab/conf/sac/config.yaml
++++ b/src/unilab/conf/sac/config.yaml
+@@ -87,6 +87,9 @@ training:
+   trace_cuda_events: true
+   nvtx_profile_ranges: false
+   replay_prefetch_mode: one_tick
++  # Emit learner metrics every iteration. Required by unilab-rl >= 1.4 and
++  # kept explicit so older dual-Spark owner configs remain forward-compatible.
++  log_interval: 1
+   torch_threads:
+     enabled: true
+     # "auto" resolves per process role from host CPU count with conservative caps.
+diff --git a/tests/algos/test_offpolicy_double_buffer_runner.py b/tests/algos/test_offpolicy_double_buffer_runner.py
+index 2eba5362..5f776d57 100644
+--- a/tests/algos/test_offpolicy_double_buffer_runner.py
++++ b/tests/algos/test_offpolicy_double_buffer_runner.py
+@@ -78,10 +78,12 @@ def _fake_env_factory(num_envs, env_cfg_override):
+     return _FakeEnv()
+ 
+ 
+-def test_offpolicy_config_has_one_replay_path():
+-    cfg = _offpolicy_cfg()
++@pytest.mark.parametrize("algo", ["sac", "flashsac"])
++def test_offpolicy_config_has_one_replay_path(algo: str):
++    cfg = _offpolicy_cfg(algo=algo)
+     assert cfg.training.replay_prefetch_mode == "one_tick"
+     assert cfg.training.env_steps_per_sync == 1
++    assert cfg.training.log_interval == 1
+ 
+ 
+ @pytest.mark.parametrize("mode", ["invalid_mode", "same_tick"])

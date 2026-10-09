@@ -30,11 +30,11 @@ clone_if_missing() {
     require_clean_repo "$repo_dir"
 }
 
-apply_pinned_patch() {
+apply_pinned_patches() {
     local repo_dir=$1
     local base_commit=$2
     local expected_tree=$3
-    local patch_file=$4
+    local patch_dir=$4
     local current_tree
     current_tree=$(git -C "$repo_dir" rev-parse HEAD^{tree})
     if [[ $current_tree == "$expected_tree" ]]; then
@@ -42,30 +42,34 @@ apply_pinned_patch() {
     fi
     git -C "$repo_dir" fetch origin "$base_commit"
     git -C "$repo_dir" checkout --detach "$base_commit"
-    git -C "$repo_dir" am "$patch_file"
-    current_tree=$(git -C "$repo_dir" rev-parse HEAD^{tree})
+    git -C "$repo_dir" apply --index "$patch_dir"/*.patch
+    current_tree=$(git -C "$repo_dir" write-tree)
     if [[ $current_tree != "$expected_tree" ]]; then
-        echo "Tree hash mismatch after applying $patch_file" >&2
+        echo "Tree hash mismatch after applying patches from $patch_dir" >&2
         echo "expected=$expected_tree actual=$current_tree" >&2
         exit 1
     fi
+    git -C "$repo_dir" \
+        -c user.name='UniLab reproducibility bundle' \
+        -c user.email='repro@localhost' \
+        commit --quiet -m 'Apply pinned dual-Spark experiment patch set'
 }
 
 mkdir -p "$target_root"
 
 clone_if_missing "$UNILAB_REPO" "$target_root/UniLab"
-apply_pinned_patch \
+apply_pinned_patches \
     "$target_root/UniLab" \
-    "$UNILAB_BASE_COMMIT" \
+    "$UNILAB_BRANCH_COMMIT" \
     "$UNILAB_OPT_TREE" \
-    "$bundle_root/patches/UniLab/0001-perf-distributed-enable-RoCE-dual-Spark-training.patch"
+    "$bundle_root/patches/UniLab"
 
 clone_if_missing "$UNILAB_RL_REPO" "$target_root/unilab_rl"
-apply_pinned_patch \
+apply_pinned_patches \
     "$target_root/unilab_rl" \
-    "$UNILAB_RL_BASE_COMMIT" \
+    "$UNILAB_RL_BRANCH_COMMIT" \
     "$UNILAB_RL_OPT_TREE" \
-    "$bundle_root/patches/unilab_rl/0001-perf-dp-optimize-dual-node-CUDA-graph-synchronizatio.patch"
+    "$bundle_root/patches/unilab_rl"
 
 clone_if_missing "$UNISIM_REPO" "$target_root/UniSim"
 git -C "$target_root/UniSim" fetch origin "$UNISIM_COMMIT"

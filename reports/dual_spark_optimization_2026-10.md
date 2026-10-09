@@ -5,6 +5,11 @@
 范围：PPO、SAC、FlashSAC；MuJoCo；G1 locomotion / motion tracking、Go2 joystick、
 Allegro in-hand；2 × NVIDIA DGX Spark（每机单卡）。
 
+版本基线：UniLab `feat/dual-spark@d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3`；
+unilab-rl `feat/dual-spark@a3ed997d5c25ff708d674778782bc1be08a53e15`；UniSim
+`v1.7.4@b48e91bbc62603299580a951c142a13c33bedae9`。实验优化代码由这些 pin
+按复现仓库中的顺序 patch 构造。
+
 ## 1. 优化目标和验收口径
 
 目标不是只优化 `g1_walk_flat`，而是在 2026-09 报告的全任务矩阵上验证优化

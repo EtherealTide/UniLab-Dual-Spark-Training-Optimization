@@ -56,14 +56,17 @@ tracking、Go2 joystick 和 Allegro in-hand MuJoCo 任务。
 
 | 项目 | 可复现版本 |
 | --- | --- |
-| UniLab | base `d540f620b531a1b5100586ce652ae070e016ad60` + 本仓库 patch；等价优化提交 `139524ac893efecf76feaf827e7236cb77307b33`；包版本 `1.3.2` |
+| UniLab | `feat/dual-spark` pin `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` + 本仓库 patch；实验优化 tree 对应提交 `139524ac893efecf76feaf827e7236cb77307b33`；包版本 `1.3.2` |
 | UniSim | tag `v1.7.4`，commit `b48e91bbc62603299580a951c142a13c33bedae9`，包版本 `unisim-core==1.7.4` |
-| unilab-rl | base `869155d0524838740de7723af81204818aa51a70` + 本仓库 patch；等价优化提交 `385a69f6d74bcfd9453bd2ed0c2d0687ae6c5556` |
+| unilab-rl | `feat/dual-spark` pin `a3ed997d5c25ff708d674778782bc1be08a53e15` + 测试时 main runtime 集成 patch + 优化 patch；实验优化 tree 对应提交 `385a69f6d74bcfd9453bd2ed0c2d0687ae6c5556` |
 | PyTorch | `2.9.0+cu130` |
 | MuJoCo | `3.11.0` |
 
-正式实验机上的优化最初是 base commit + working-tree patch。这里把相同差异导出为标准
-`git format-patch`，并记录应用后预期 tree hash；因此不依赖尚未发布的远端分支。
+这里明确区分“公开 `feat/dual-spark` 分支 pin”和“实际实验 tree”。UniLab patch 还包含
+实验需要的 off-policy logging 修复；unilab-rl 的第一份 patch 把公开分支集成到测试时
+使用的 main runtime tree，第二份才是本轮 DP/CUDA Graph 优化。每一步来源和最终 tree
+hash 都记录在 [`patches/README.md`](patches/README.md)，不会把本地实验提交误写成远端
+分支 HEAD。
 
 ## 仓库结构
 
@@ -210,12 +213,12 @@ PPO summary 中 `completed_iterations=499` 是 0-based 编号；事件文件应�
 
 ```bash
 git clone https://github.com/Motphys/UniLab.git
-git -C UniLab checkout d540f620b531a1b5100586ce652ae070e016ad60
-git -C UniLab am ../patches/UniLab/*.patch
+git -C UniLab checkout d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3
+git -C UniLab apply ../patches/UniLab/*.patch
 
 git clone https://github.com/unilabsim/unilab_rl.git
-git -C unilab_rl checkout 869155d0524838740de7723af81204818aa51a70
-git -C unilab_rl am ../patches/unilab_rl/*.patch
+git -C unilab_rl checkout a3ed997d5c25ff708d674778782bc1be08a53e15
+git -C unilab_rl apply ../patches/unilab_rl/*.patch
 ```
 
 详见 [`patches/README.md`](patches/README.md)。

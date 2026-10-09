@@ -171,6 +171,11 @@ FlashSAC 的绝对 iteration 时间下降约 1.9–3.8×。由于 learner 本身
 | UniLab | `perf/dual-spark-20261008` / code `139524ac` | RoCE launcher；英中文文档；复现命令 |
 | unilab_rl | `perf/dual-spark-20261008` / `385a69f` | graph 内 DP；持久 bucket view；collective 融合；finite gate 一致性 |
 
+公开分支基线固定为 UniLab `feat/dual-spark@d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3`
+和 unilab-rl `feat/dual-spark@a3ed997d5c25ff708d674778782bc1be08a53e15`；表中的
+`139524ac` / `385a69f` 是应用本项目 patch 后的实验优化 tree 对应提交，不是远程
+`feat/dual-spark` HEAD。
+
 验证：
 
 - uni_rl CPU-safe focused suite：57 passed, 20 skipped, 1 deselected；
