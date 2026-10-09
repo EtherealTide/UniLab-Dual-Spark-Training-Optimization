@@ -54,7 +54,9 @@ algo = "flashsac" if any("train_flashsac.py" in a for a in sys.argv) else (
 assert os.environ.get("PYTHONUNBUFFERED") == "1"
 assert settings["++training.log_interval"] == "1"
 print(f"mock start rank={rank}", flush=True)
+print("Actor Model: mock model details", flush=True)
 print(f"mock stderr rank={rank}", file=sys.stderr, flush=True)
+print("Learning iteration 0/2", flush=True)
 time.sleep(float(os.environ.get("FAKE_DELAY", "0.05")))
 if rank == os.environ.get("FAKE_FAIL_RANK"):
     print("mock training failure", file=sys.stderr)
@@ -77,6 +79,7 @@ if rank == "0" and not os.environ.get("FAKE_MISSING_SUMMARY"):
         "last_checkpoint": str(run_dir / "model.pt"),
     }
     (run_dir / "run_summary.json").write_text(json.dumps(summary))
+print("Learning iteration 1/2", flush=True)
 print(f"mock finished rank={rank}", flush=True)
 '''
 
@@ -124,19 +127,22 @@ class LauncherTests(unittest.TestCase):
                               stderr=subprocess.STDOUT, timeout=15)
 
     def test_single_streams_before_exit_and_prints_statistics(self) -> None:
-        process = subprocess.Popen(self.command(), env={**self.env, "FAKE_DELAY": "0.5"},
+        process = subprocess.Popen(self.command(), env={**self.env, "FAKE_DELAY": "0.5", "CONSOLE_MODE": "full"},
                                    text=True, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT)
         try:
             lines = []
+            saw_live_output = False
             for line in process.stdout:
                 lines.append(line)
                 if "[single] mock start" in line:
                     self.assertIsNone(process.poll(), "Output was buffered until exit")
-                    break
-            else:
-                self.fail("No live training output")
-            output = "".join(lines) + process.communicate(timeout=15)[0]
+                    saw_live_output = True
+            self.assertTrue(saw_live_output, "No live training output")
+            # Keep reading through the same TextIOWrapper: communicate() after
+            # partial reads can skip bytes already prefetched by that wrapper.
+            process.wait(timeout=15)
+            output = "".join(lines)
             self.assertEqual(process.returncode, 0, output)
             self.assertIn("[single] mock stderr", output)
             self.assertIn("Completed iterations: 2 / 2", output)
@@ -146,6 +152,7 @@ class LauncherTests(unittest.TestCase):
             saved = Path(f"/tmp/{self.run_name}_single.log").read_text()
             self.assertIn("mock start", saved)
             self.assertIn("mock stderr", saved)
+            self.assertIn("[launcher] single exited (code=0)", saved)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -156,7 +163,7 @@ class LauncherTests(unittest.TestCase):
         for algo in ("ppo", "sac", "flashsac"):
             with self.subTest(algo=algo):
                 self.run_name += f"_{algo}"
-                result = self.run_launcher("dual", algo)
+                result = self.run_launcher("dual", algo, CONSOLE_MODE="full")
                 self.assertEqual(result.returncode, 0, result.stdout)
                 self.assertIn("[rank0] mock start rank=0", result.stdout)
                 self.assertIn("[rank1] mock start rank=1", result.stdout)
@@ -165,6 +172,57 @@ class LauncherTests(unittest.TestCase):
                 if algo != "ppo":
                     self.assertIn("Global learner throughput, final iteration (rows/s): 12,345.000", result.stdout)
                 self.cleanup_logs()
+
+    def test_compact_mode_hides_details_but_preserves_log_and_stats(self) -> None:
+        result = self.run_launcher(CONSOLE_MODE="compact")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("[single] Iteration 1/2", result.stdout)
+        self.assertIn("[single] Iteration 2/2", result.stdout)
+        self.assertIn("Full live log from another coordinator terminal: ssh master-alias", result.stdout)
+        self.assertIn("tail", result.stdout)
+        self.assertIn("=== Final training statistics (rank0) ===", result.stdout)
+        self.assertIn("[launcher] single exited (code=0)", result.stdout)
+        self.assertNotIn("mock model details", result.stdout)
+        self.assertNotIn("mock stderr", result.stdout)
+        saved = Path(f"/tmp/{self.run_name}_single.log").read_text()
+        self.assertIn("mock model details", saved)
+        self.assertIn("mock stderr", saved)
+
+    def test_compact_failure_shows_log_tail(self) -> None:
+        result = self.run_launcher(CONSOLE_MODE="compact", FAKE_FAIL_RANK="0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Last 20 lines", result.stdout)
+        self.assertIn("mock training failure", result.stdout)
+        self.assertIn("[launcher] single exited (code=7)", result.stdout)
+        self.assertNotIn("DONE:", result.stdout)
+
+    def test_compact_dual_writes_rank1_completion_marker(self) -> None:
+        result = self.run_launcher("dual", CONSOLE_MODE="compact")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("mock model details", result.stdout)
+        self.assertIn("[rank1] [launcher] rank1 exited (code=0)", result.stdout)
+        self.assertIn("[launcher] rank1 exited (code=0)",
+                      Path(f"/tmp/{self.run_name}_rank1.log").read_text())
+
+    def test_compact_filter_throttles_progress_and_keeps_final_iteration(self) -> None:
+        log = "\n".join(f"Learning iteration {i}/100" for i in range(100)) + "\n"
+        result = subprocess.run(
+            ["awk", "-v", "label=rank0", "-v", "mode=compact", "-v", "interval=3600",
+             "-f", str(ROOT / "scripts/filter_console.awk")],
+            input=log, text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(result.stdout.splitlines(),
+                         ["[rank0] Iteration 1/100", "[rank0] Iteration 100/100"])
+
+    def test_compact_filter_handles_offpolicy_progress(self) -> None:
+        log = "│ Iterations: 1/500 │\n│ Iterations: 499/500 │\n│ Iterations: 500/500 │\n"
+        result = subprocess.run(
+            ["awk", "-v", "label=rank0", "-v", "mode=compact", "-v", "interval=3600",
+             "-f", str(ROOT / "scripts/filter_console.awk")],
+            input=log, text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(result.stdout.splitlines(),
+                         ["[rank0] Iteration 1/500", "[rank0] Iteration 500/500"])
 
     def test_training_failure_is_not_hidden_by_tee(self) -> None:
         for mode in ("single", "dual"):

@@ -86,7 +86,8 @@ are documented in [`patches/README.md`](patches/README.md).
 ├── tests/                       # Launcher and summary regression tests
 └── scripts/
     ├── bootstrap.sh             # Clone, patch, install, verify
-    ├── run_one.sh               # Live single-/dual-node training launcher
+    ├── run_one.sh               # Compact single-/dual-node training launcher
+    ├── filter_console.awk       # Compact progress / optional full output
     ├── print_run_summary.py     # Final statistics and completion verification
     ├── run_matrix.sh            # Full 16-run matrix
     └── extract_metrics.py       # Fixed-window TensorBoard metrics
@@ -180,7 +181,7 @@ The launcher respects `~/.ssh/config`, so SSH aliases such as `HOST0=dgx1` and
 the coordinator. `BatchMode=yes` makes authentication failures explicit;
 `ConnectTimeout=10` bounds connection setup, not training duration.
 
-## 3. Launch an experiment with live output
+## 3. Launch an experiment
 
 Argument order: `mode algo task envs run_name port`.
 
@@ -219,10 +220,34 @@ Smoke-test throughput is not a benchmark.
 
 ### Console output and saved logs
 
-Python runs unbuffered, with `training.log_interval=1`. Output appears live with
-`[single]`, `[rank0]`, or `[rank1]` prefixes. NCCL/distributed initialization and
-compilation may take time before the first iteration; rank1 generally prints
-initialization messages while rank0 owns iteration metrics and checkpoints.
+The default `CONSOLE_MODE=compact` prints startup stages, full-log viewing
+commands, a short progress line at most once every 30 seconds per rank, rank exit
+markers, and final statistics. The first and final iteration are always shown
+when the runtime emits a recognized progress line. Model definitions, individual
+loss/reward fields, compiler messages, and warnings stay in the full log. On a
+failure, the launcher also prints the last 20 log lines for diagnosis.
+
+Use `PROGRESS_INTERVAL=60` to reduce progress updates, or opt into every log line:
+
+```bash
+CONSOLE_MODE=full bash scripts/run_one.sh dual ppo go2_joystick_flat 2048 \
+  ppo_dual_go2_500_verbose_trial1 29705
+```
+
+Python still runs unbuffered, with `training.log_interval=1`, so saved logs remain
+complete and live in both modes. Console lines carry `[single]`, `[rank0]`, or
+`[rank1]` prefixes. NCCL initialization and compilation may take time before the
+first iteration.
+
+For **PPO**, rank0 owns iteration metrics, TensorBoard events, and checkpoints.
+Rank1 can successfully complete an entire run without printing any iteration
+metrics: its last runtime message may remain `Synchronizing parameters for rank 1...`.
+That message records the start of synchronization, not the worker's current state.
+The launcher appends `[launcher] rank1 exited (code=0)` to its log when it exits
+successfully. Check rank0's advancing iterations and final summary to establish
+training health; rank1 silence alone cannot distinguish training from a stalled
+collective. A missing marker on an older log is expected because older launchers
+did not write one. Nonzero exit markers indicate failure.
 
 The same output is saved using `tee` on the training nodes:
 
@@ -231,6 +256,14 @@ The same output is saved using `tee` on the training nodes:
 | single | `HOST0` | `/tmp/<run_name>_single.log` |
 | dual | `HOST0` | `/tmp/<run_name>_rank0.log` |
 | dual | `HOST1` | `/tmp/<run_name>_rank1.log` |
+
+At startup the launcher prints a copyable command for each full log, for example:
+
+```bash
+# Run from another terminal on the coordinator.
+ssh nvidia@192.168.110.48 'tail -n 40 -F /tmp/ppo_dual_go2_500_rank0.log'
+ssh nvidia@192.168.110.40 'tail -n 40 -F /tmp/ppo_dual_go2_500_rank1.log'
+```
 
 TensorBoard events, checkpoints, `run_config.json`, and `run_summary.json` live
 under `$REMOTE_ROOT/UniLab/logs/<run_name>` on `HOST0`. The formatter is sent over
@@ -274,7 +307,7 @@ bash scripts/run_matrix.sh
 ```
 
 The matrix runs eight single-node and eight dual-node workloads sequentially,
-with live output and final statistics for each. It uses fixed run names and is
+with compact progress and final statistics for each. It uses fixed run names and is
 intended for a fresh logs directory; existing runs trigger the same preflight
 protection. Rank0 is the only TensorBoard/checkpoint writer.
 
@@ -310,6 +343,10 @@ file must contain 500 `Perf/total_fps` samples; the extractor validates this.
 - **Existing run directory:** choose a new run name; do not mix repeated attempts.
 - **Rendezvous timeout:** verify both ranks launched, `MASTER_ADDR`, the selected
   port, and direct-link reachability. A `single` run cannot pair with a dual rank1.
+- **Rank1 log ends at parameter synchronization:** for PPO this is normal if
+  rank0 progresses or the summary confirms completion with `world_size=2`. Use
+  the exit marker for new runs. If rank0 also stops advancing, inspect both logs
+  and processes rather than assuming silence means success.
 - **Low throughput:** check `nvitop`/`nvidia-smi` for concurrent workloads. A live
   process stuck in parameter synchronization is not a zombie; zombie status is
   `Z` in `ps`. Stop the identified job's `torchrun` launchers with `SIGTERM` first;
@@ -352,5 +389,6 @@ On Linux, without SSH access or a GPU:
 python3 -m unittest discover -s tests -v
 ```
 
-These tests exercise live streaming, both rank labels, exit-code propagation,
-SSH preflight, stale-run protection, and PPO/SAC/FlashSAC summary counting.
+These tests exercise compact/full output, progress throttling, rank exit markers,
+live streaming, exit-code propagation, SSH preflight, stale-run protection, and
+PPO/SAC/FlashSAC summary counting.

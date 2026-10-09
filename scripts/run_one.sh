@@ -5,6 +5,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 bundle_root=$(cd -- "$script_dir/.." && pwd)
 cluster_file=${CLUSTER_FILE:-$bundle_root/config/cluster.env}
 iterations_override=${MAX_ITERATIONS:-}
+console_override=${CONSOLE_MODE:-}
+progress_override=${PROGRESS_INTERVAL:-}
 
 if [[ $# -ne 6 ]]; then
     echo "usage: $0 <single|dual> <ppo|sac|flashsac> <task> <envs> <run_name> <port>" >&2
@@ -24,6 +26,17 @@ envs=$4
 run_name=$5
 port=$6
 max_iterations=${iterations_override:-${MAX_ITERATIONS:-500}}
+console_mode=${console_override:-${CONSOLE_MODE:-compact}}
+progress_interval=${progress_override:-${PROGRESS_INTERVAL:-30}}
+
+if [[ $console_mode != compact && $console_mode != full ]]; then
+    echo "CONSOLE_MODE must be compact or full" >&2
+    exit 2
+fi
+if [[ ! $progress_interval =~ ^[1-9][0-9]*$ ]]; then
+    echo "PROGRESS_INTERVAL must be a positive number of seconds" >&2
+    exit 2
+fi
 
 for value in "$mode" "$algo" "$task" "$envs" "$run_name" "$port"; do
     if [[ ! $value =~ ^[A-Za-z0-9_.-]+$ ]]; then
@@ -98,21 +111,40 @@ fi
 
 run_rank() {
     local host=$1 label=$2 train_cmd=$3 log_file=$4
-    local remote_cmd quoted_cmd quoted_log
+    local remote_cmd quoted_cmd quoted_log rc
     printf -v quoted_log '%q' "$log_file"
     # pipefail preserves the training exit code rather than the exit code of tee.
-    printf -v remote_cmd 'set -o pipefail; cd %s && %s 2>&1 | tee %s' \
-        "$quoted_dir" "$train_cmd" "$quoted_log"
+    # Write an exit marker to each raw log, including normally quiet rank1.
+    printf -v remote_cmd 'set -o pipefail; cd %s || exit; %s 2>&1 | tee %s; rc=$?; printf "\n[launcher] %s exited (code=%%s)\n" "$rc" | tee -a %s; exit "$rc"' \
+        "$quoted_dir" "$train_cmd" "$quoted_log" "$label" "$quoted_log"
     printf -v quoted_cmd '%q' "$remote_cmd"
-    ssh -n "${ssh_options[@]}" "$host" "bash -c $quoted_cmd" 2>&1 |
-        sed -u "s/^/[$label] /"
+    if ssh -n "${ssh_options[@]}" "$host" "bash -c $quoted_cmd" 2>&1 |
+        awk -v label="$label" -v mode="$console_mode" -v interval="$progress_interval" \
+            -f "$script_dir/filter_console.awk"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [[ $rc -ne 0 && $console_mode == compact ]]; then
+        echo "[$label] Failed (exit=$rc). Last 20 lines from $host:$log_file:" >&2
+        ssh -n "${ssh_options[@]}" "$host" "tail -n 20 $quoted_log" >&2 || true
+    fi
+    return "$rc"
+}
+
+print_log_hint() {
+    local host=$1 log_file=$2
+    # log_file contains only /tmp plus the validated run_name and rank suffix.
+    printf "[log] Full live log from another coordinator terminal: ssh %q 'tail -n 40 -F %s'\n" "$host" "$log_file"
 }
 
 started=$SECONDS
 echo "[run] mode=$mode algo=$algo task=$task envs_per_rank=$envs iterations=$max_iterations"
+echo "[run] console=$console_mode (CONSOLE_MODE=full enables all training output)"
 echo "[run] TensorBoard/checkpoints/summary: $HOST0:$remote_dir/logs/$run_name"
 if [[ $mode == single ]]; then
     echo "[run] Console log: $HOST0:/tmp/${run_name}_single.log"
+    print_log_hint "$HOST0" "/tmp/${run_name}_single.log"
     if run_rank "$HOST0" single "env PYTHONUNBUFFERED=1 $python $entry $common_args $algo_args" \
         "/tmp/${run_name}_single.log"; then
         rank0_rc=0
@@ -137,6 +169,11 @@ else
     fi
     echo "[run] Rendezvous: $MASTER_ADDR:$port"
     echo "[run] Console logs: $HOST0:/tmp/${run_name}_rank0.log and $HOST1:/tmp/${run_name}_rank1.log"
+    print_log_hint "$HOST0" "/tmp/${run_name}_rank0.log"
+    print_log_hint "$HOST1" "/tmp/${run_name}_rank1.log"
+    if [[ $algo == ppo ]]; then
+        echo "[run] PPO iteration metrics are written by rank0; rank1 may stay quiet until its exit marker."
+    fi
     run_rank "$HOST1" rank1 "$rank1_cmd" "/tmp/${run_name}_rank1.log" &
     rank1_ssh_pid=$!
     if run_rank "$HOST0" rank0 "$rank0_cmd" "/tmp/${run_name}_rank0.log"; then
