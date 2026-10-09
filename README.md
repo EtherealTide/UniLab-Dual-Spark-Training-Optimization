@@ -280,10 +280,11 @@ protection. Rank0 is the only TensorBoard/checkpoint writer.
 
 ## 4. Extract comparable absolute throughput
 
-Run on `HOST0`, in the bundle checkout:
+Run on `HOST0`, in the bundle checkout. Set `REMOTE_ROOT` to the path used for
+bootstrap; this does not require copying the coordinator's SSH config to `HOST0`:
 
 ```bash
-source config/cluster.env
+REMOTE_ROOT=/home/nvidia/unilab-dual-spark-repro
 "$REMOTE_ROOT/UniLab/.venv/bin/python" scripts/extract_metrics.py \
   --root "$REMOTE_ROOT/UniLab/logs" \
   --manifest data/run_manifest.csv \
