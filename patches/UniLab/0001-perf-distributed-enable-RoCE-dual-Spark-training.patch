@@ -1,0 +1,582 @@
+From 139524ac893efecf76feaf827e7236cb77307b33 Mon Sep 17 00:00:00 2001
+From: EtherealTide <22371160@buaa.edu.cn>
+Date: Thu, 8 Oct 2026 14:06:18 +0800
+Subject: [PATCH] perf(distributed): enable RoCE dual-Spark training
+
+---
+ README.md                                     |   8 +-
+ README_zh.md                                  |  10 +-
+ .../dual_spark_optimization_2026-10.md        | 257 ++++++++++++++++++
+ .../2-algorithms/5-multi-node-training.md     |  23 +-
+ .../2-algorithms/5-multi-node-training.md     |  21 +-
+ scripts/launch_distributed.py                 |  36 ++-
+ tests/test_launch_distributed.py              |  56 ++++
+ 7 files changed, 390 insertions(+), 21 deletions(-)
+ create mode 100644 docs/reports/dual_spark_optimization_2026-10.md
+ create mode 100644 tests/test_launch_distributed.py
+
+diff --git a/README.md b/README.md
+index 530d75c5..9640ff7a 100644
+--- a/README.md
++++ b/README.md
+@@ -105,10 +105,11 @@ and [support matrix](https://unilabsim.github.io/UniLab-doc/en/5-reference/5-sup
+ 
+ Two single-GPU hosts can train synchronously with one command. Validated on
+ two NVIDIA Spark (GB10) hosts over a QSFP link — system throughput
+-**1.40–1.97×** (PPO up to 1.97×, FlashSAC up to 1.91×). See the
++**1.65–1.98×** (PPO 1.98×, FlashSAC 1.92× at the default
++2048-env/8192-batch workload over RoCE). See the
+ [complete setup guide](docs/sphinx/source/en/2-user_guide/2-algorithms/5-multi-node-training.md)
+ (connect hosts → clone repos → install → launch → verify) and the
+-[dual-Spark throughput report](docs/reports/dual_spark_2026-09.md).
++[dual-Spark optimization report](docs/reports/dual_spark_optimization_2026-10.md).
+ 
+ ```bash
+ # One command on spark0 launches both nodes via SSH.
+@@ -126,7 +127,8 @@ python scripts/launch_distributed.py \
+   --algo flashsac --task g1_walk_flat --sim mujoco \
+   --ifname enp1s0f1np1 --master-ip 192.168.100.1 \
+   --peer spark1 --num-nodes 2 \
+-  algo.num_envs=4096 algo.batch_size=8192
++  --nccl-transport ib --nccl-ib-hca rocep1s0f1 \
++  algo.num_envs=2048 algo.batch_size=8192 algo.policy_frequency=4
+ ```
+ 
+ ## Ecosystem
+diff --git a/README_zh.md b/README_zh.md
+index 9658ad89..daf9b78a 100644
+--- a/README_zh.md
++++ b/README_zh.md
+@@ -97,11 +97,12 @@ uv run train --algo sac --task g1_walk_flat --sim mujoco
+ ## 多节点训练
+ 
+ 两台单 GPU 主机可通过一条命令同步训练。已在两台经 QSFP 直连的
+-NVIDIA Spark（GB10）上验证——系统吞吐 **1.40–1.97×**（PPO 最高
+-1.97×，FlashSAC 最高 1.91×）。完整流程见
++NVIDIA Spark（GB10）上验证——系统吞吐 **1.65–1.98×**（PPO 最高
++1.98×，FlashSAC 在默认 2048 env / 8192 batch 负载下通过 RoCE 达到
++1.92×）。完整流程见
+ [双机搭建指南](docs/sphinx/source/zh_CN/2-user_guide/2-algorithms/5-multi-node-training.md)
+ （连接主机 → 克隆仓库 → 安装 → 启动 → 验证）与
+-[双 Spark 吞吐报告](docs/reports/dual_spark_2026-09.md)。
++[双 Spark 优化报告](docs/reports/dual_spark_optimization_2026-10.md)。
+ 
+ ```bash
+ # 只需在 spark0 上一条命令，通过 SSH 自动拉起 spark1。
+@@ -119,7 +120,8 @@ python scripts/launch_distributed.py \
+   --algo flashsac --task g1_walk_flat --sim mujoco \
+   --ifname enp1s0f1np1 --master-ip 192.168.100.1 \
+   --peer spark1 --num-nodes 2 \
+-  algo.num_envs=4096 algo.batch_size=8192
++  --nccl-transport ib --nccl-ib-hca rocep1s0f1 \
++  algo.num_envs=2048 algo.batch_size=8192 algo.policy_frequency=4
+ ```
+ 
+ ## 生态
+diff --git a/docs/reports/dual_spark_optimization_2026-10.md b/docs/reports/dual_spark_optimization_2026-10.md
+new file mode 100644
+index 00000000..f5841154
+--- /dev/null
++++ b/docs/reports/dual_spark_optimization_2026-10.md
+@@ -0,0 +1,257 @@
++# UniLab 双 DGX Spark 训练优化报告（2026-10）
++
++## 1. 执行摘要
++
++本轮对两台 NVIDIA DGX Spark（每机单卡）上的 UniLab 真实训练路径进行了
++端到端剖析和优化。测试任务为 MuJoCo `g1_walk_flat`，off-policy 默认负载为
++每 rank 2048 env、8192 batch、8 次 critic update 和 2 次 actor update。
++
++最终结果：
++
++| 算法 | 单机稳态吞吐 | 双机稳态吞吐 | 加速比 | 双机 iter 开销 |
++| --- | ---: | ---: | ---: | ---: |
++| PPO | 40.51k steps/s | 80.24k steps/s | **1.98×** | +1.0% |
++| SAC | 38.93k steps/s | 64.14k steps/s | **1.65×** | +21.5% |
++| FlashSAC | 8.75k steps/s | 16.52k steps/s | **1.89×** | +6.1% |
++
++FlashSAC 在 300 轮短测的固定窗口中达到 1.92×；1000 轮长测稳态均值为
++1.89×。SAC 仍受轻量 learner 和频繁 collective 的固定成本限制，但已从旧报告中
++的 1.42× 提升到 1.65×。
++
++核心结论是：先前的主要限制不是 200 Gb/s 光链路带宽，而是强制使用 TCP 并禁用
++P2P/SHM 的兼容配置，叠加了 CUDA Graph 外梯度打包和过多 collective。切换到
++RoCE、让 NCCL 保持 P2P/SHM 可用、将 all-reduce 放进整周期 CUDA Graph，并使用持久
++flat bucket view 后，FlashSAC 的双机额外成本降到约 6%。
++
++## 2. 实验环境
++
++| 项目 | 配置 |
++| --- | --- |
++| 主机 | 2 × NVIDIA DGX Spark，GB10，每机 1 GPU / 20 CPU cores |
++| 数据链路 | QSFP 直连，`enp1s0f1np1`，协商 200000 Mb/s |
++| RoCE HCA | `rocep1s0f1`，`ibv_devinfo` 状态 `PORT_ACTIVE` |
++| 地址 | rank 0 `10.77.0.1`，rank 1 `10.77.0.2` |
++| 通信 | NCCL `NET/IB`，TCPStore rendezvous |
++| GPU Direct | NCCL 显示 `GDR 0`；本轮未改动系统驱动/内核模块 |
++| 软件 | PyTorch 2.9.0+cu130，CUDA 13，UniLab / unilab_rl `perf/dual-spark-20261008` |
++| 仿真 | MuJoCo，`g1_walk_flat` |
++
++NCCL 初始化日志确认了 `Using network IB`、`rocep1s0f1`、200000 Mb/s。当前
++`libmlx5` 缺少所需的 DMA-BUF 符号，`nvidia_peermem` 存在但未加载，因此本轮结果
++是在 `GDR 0` 下取得的。这也意味着 1.89–1.92× 不依赖系统级 GDR 调整。
++
++## 3. 口径与方法
++
++### 3.1 并行语义
++
++每台 Spark 保持与单机基线相同的 `num_envs=2048` 和 `batch_size=8192`。因此：
++
++- 单机每轮采集 2048 env steps；
++- 双机每轮全局采集 4096 env steps；
++- 每个 rank 保有本地 collector 和 replay，经验数据不跨网络；
++- 每次 optimizer boundary 对梯度求和并除以 world size；
++- rank 0 先广播初始参数，后续两 rank 参数保持一致。
++
++双机相当于每次使用两个本地 batch 的全局均值梯度；它与单机的随机轨迹和有效全局
++batch 不完全相同，因此质量判定使用同 seed 、相同超参下的奖励与 episode length
++趋势，而不要求与单机 checkpoint 逐位一致。
++
++### 3.2 统计窗口
++
++- 300 轮 A/B：丢弃前 50 轮，统计 iteration 50–299；
++- 1000 轮正式实验：丢弃前 50 轮，统计后续 950 轮吞吐；
++- 质量：使用最后 100 条有效 TensorBoard 记录的均值；
++- 不用首轮编译/建图时间，也不用单个末轮数值作为加速比。
++
++off-policy 的 `Perf/total_fps` 是全局 env steps/s；双机每轮的分子是 4096，
++单机是 2048。
++
++## 4. 实现优化
++
++### 4.1 FlashSAC 整周期 CUDA Graph 内 DP
++
++原有 FlashSAC 在 NVIDIA CUDA whole-cycle 路径上会直接拒绝 DP callback。本轮实现了：
++
++- 在 graph warmup/capture/replay 边界注册 DP lifecycle hooks；
++- 把 NCCL all-reduce 作为 CUDA Graph 节点捕获；
++- replay 前统计 collective 次数，可选用 CUDA event 统计时间；
++- 跨 rank 同步 finite-loss sentinel，使 NaN/Inf 的 optimizer gate 保持全局一致；
++- graph capture 失败时保留原有 eager fallback。
++
++该改动使 FlashSAC 的整周期 graph 优化和双机同步能够同时使用。相比旧分支
++823.2 ms/iter 的单机 FlashSAC，当前 1000 轮实测为 234.1 ms/iter，单机绝对性能
++提升 **3.52×**。
++
++### 4.2 持久 flat gradient bucket view
++
++whole-cycle graph 的 gradient storage 地址稳定。DP 层在 warmup 时把每个参数的
++`.grad` 绑定到 flat all-reduce buffer 的不重叠 view，后续 replay 直接对 backward 输出就地
++reduce，消除每参数、每 update 的 pack/unpack kernel。
++
++普通 eager 路径仍使用 copy；finite sentinel 也明确标记为 copy-only，避免同一标量同时别名
++到多个 bucket。
++
++### 4.3 合并数学独立的 collective
++
++- FlashSAC：actor + temperature 梯度合并，默认负载每轮从 12 次降到 10 次；
++- SAC：critic + alpha 梯度合并，每轮从 18 次降到 10 次；
++- 两个 loss 使用独立 finite sentinel，合并传输但不合并 optimizer gate。
++
++SAC 300 轮 A/B：
++
++| 版本 | iter 50–299 | 吞吐 | collective/iter |
++| --- | ---: | ---: | ---: |
++| 未融合 | 65.57 ms | 62.74k steps/s | 18 |
++| critic + alpha 融合 | 64.37 ms | 63.85k steps/s | 10 |
++
++融合带来约 1.8% 吞吐改善。收益不大，但固定窗口为正且减少了 44% 的同步次数，
++因此保留。
++
++### 4.4 TCP 到 RoCE
++
++UniLab 启动器新增：
++
++- `--nccl-transport {tcp,auto,ib}`；
++- `--nccl-ib-hca`；
++- `ib` 模式显式设置 `NCCL_IB_DISABLE=0`、HCA 和 socket interface；
++- 验证拓扑下显式保持 `NCCL_P2P_DISABLE=0`、`NCCL_SHM_DISABLE=0`；
++- `tcp` 仍作为安全默认值，没有 RDMA 时不会意外改变现有行为。
++
++`DpParameterSync.start()` 只对单机 FileStore 兼容路径默认禁用 P2P/SHM；多节点
++TCPStore 不再在库内强制关闭。
++
++## 5. 性能结果
++
++### 5.1 FlashSAC（1000 轮）
++
++| 指标 | 单机 | 双机 | 变化 |
++| --- | ---: | ---: | ---: |
++| iteration | 234.12 ms | 248.49 ms | +6.14% |
++| learning | 228.52 ms | 245.96 ms | +7.63% |
++| collector env step | 36.40 ms | 35.87 ms/rank | -1.4% |
++| 全局吞吐 | 8,748.56 | 16,518.22 steps/s | **1.888×** |
++| DP collective | — | 10/iter | — |
++
++300 轮正式窗口更高：238.51 ms 单机，248.16 ms 双机，8,616.94 到
++16,541.26 steps/s，为 **1.920×**。报告主表使用更保守的 1000 轮长测。
++
++### 5.2 SAC（1000 轮）
++
++| 指标 | 单机 | 双机 | 变化 |
++| --- | ---: | ---: | ---: |
++| iteration | 52.74 ms | 64.08 ms | +21.50% |
++| learning | 50.15 ms | 62.49 ms | +24.6% |
++| collector env step | 37.56 ms | 37.78 ms/rank | +0.6% |
++| 全局吞吐 | 38,933.51 | 64,142.46 steps/s | **1.647×** |
++| DP collective | — | 10/iter | — |
++
++SAC learner 已经快到只需约 50 ms。虽然 RoCE 和 collective 融合明显减少固定开销，
++11.3 ms 的双机额外 iteration 时间仍占单机基线的 21.5%，因此理论上就不可能在
++该网络和当前 optimizer 边界下达到 1.9×。
++
++### 5.3 PPO
++
++PPO 使用 `torchrun --nnodes=2 --nproc_per_node=1`，统计 iteration 50–199：
++
++| 指标 | 单机 | 双机 | 变化 |
++| --- | ---: | ---: | ---: |
++| collection | 1007.27 ms | 969.32 ms/rank | -3.8% |
++| learning | 210.54 ms | 260.32 ms | +23.6% |
++| 总 iteration | 1217.81 ms | 1229.64 ms | +1.0% |
++| 全局吞吐 | 40,510.26 | 80,241.83 steps/s | **1.981×** |
++
++PPO 的时间主要在 CPU/MuJoCo rollout 采集，它在两台主机上干净分片。分布式
++learner 多用约 50 ms，但采集略快，最终每轮只增加 1%，因此几乎线性扩展。
++
++## 6. 通信剖析
++
++FlashSAC trace 的对照：
++
++| 配置 | DP sync | collective | iteration | 吞吐 |
++| --- | ---: | ---: | ---: | ---: |
++| TCP，IB/P2P/SHM 禁用 | 43.36 ms | 10 | ~279.15 ms | ~14.67k |
++| RoCE，P2P/SHM 开启 | 11.43 ms 中位数（13.70 ms 均值） | 10 | 248.16 ms 正式窗口 | 16.54k |
++
++同步中位数降低 **73.6%**。trace 本身开启 CUDA event 会带来少量扰动，所以
++最终吞吐采用关闭 trace 的 300/1000 轮正式实验，同步时间则采用 trace 记录。
++
++由于 `GDR 0`，当前仍存在 GPU 到 NIC 的 staging 路径。但是已经得到 1.89–1.92×，
++表明在本负载下不应把内核模块调整作为投产的必要前提。
++
++## 7. 训练质量（1000 轮尾部 100 条记录）
++
++| 算法 | 单机 reward / ep len | 双机 reward / ep len | 判定 |
++| --- | ---: | ---: | --- |
++| PPO（尾部 20） | 0.052 / 32.08 | 0.736 / 58.89 | 双机每轮样本翻倍，学习更快 |
++| SAC | 17.08 / 74.94 | 19.22 / 79.71 | 双机不低于单机 |
++| FlashSAC | 6.06 / 56.30 | 5.70 / 56.08 | 趋势和 episode length 等价 |
++
++两组双机运行均无 NaN/Inf、hang 或 rank 分歧，并正常输出 checkpoint。在只训练 1000
++轮的早期阶段，reward 本身仍在快速上升，因此这一结果用于验证“优化没有破坏学习”，
++不代替一个 5000+ 轮的收敛性 benchmark。
++
++## 8. 失败或收益有限的尝试
++
++1. **只换 RoCE、仍禁用 P2P/SHM**：短测约 259 ms/iter，优于旧 TCP，但不如
++   RoCE + P2P/SHM 开启的正式 248 ms。
++2. **SAC collective 融合**：30 轮 smoke 中无法观察明确收益；只有使用 300 轮固定窗口
++   才确认约 +1.8%。这说明编译、learning starts 和 collector 暖机会误导过短 A/B。
++3. **GDR 探测**：NCCL 使用 IB 但仍报 `GDR 0`。根因与 `libmlx5` DMA-BUF 符号和
++   `nvidia_peermem` 状态有关。本轮不对系统做风险较高的驱动/内核变更。
++4. **GB10 PTXAS**：GB10 是 compute capability 12.1，但当前 Triton 捆绑 `ptxas` 最高识别
++   12.0。首次 Inductor autotune 会输出 `sm_121a` 失败日志，然后回退/命中缓存并正常
++   完成训练。这是工具链兼容问题，不是 DP 逻辑失败。
++
++## 9. 复现命令
++
++在 rank 0（`10.77.0.1`）的 UniLab 目录执行，并确保可以无交互 SSH 到
++`10.77.0.2`：
++
++```bash
++.venv/bin/python scripts/launch_distributed.py \
++  --algo flashsac --task g1_walk_flat --sim mujoco \
++  --num-nodes 2 --peer 10.77.0.2 \
++  --master-ip 10.77.0.1 --ifname enp1s0f1np1 \
++  --nccl-transport ib --nccl-ib-hca rocep1s0f1 \
++  --remote-dir /home/nvidia/unilab-dual-spark-opt-20261008/UniLab \
++  --dp-port 29631 --log-dir logs/flashsac_dual_roce \
++  algo.num_envs=2048 algo.batch_size=8192 \
++  algo.updates_per_step=8 algo.policy_frequency=4 \
++  algo.max_iterations=1000
++```
++
++SAC 只需把 `--algo flashsac` 改为 `--algo sac`。PPO：
++
++```bash
++.venv/bin/python scripts/launch_distributed.py \
++  --algo ppo --task g1_walk_flat --sim mujoco \
++  --num-nodes 2 --peer 10.77.0.2 \
++  --master-ip 10.77.0.1 --ifname enp1s0f1np1 \
++  --nccl-transport ib --nccl-ib-hca rocep1s0f1 \
++  --remote-dir /home/nvidia/unilab-dual-spark-opt-20261008/UniLab \
++  --port 29630 --log-dir logs/ppo_dual_roce \
++  algo.num_envs=2048 algo.max_iterations=200
++```
++
++建议保留独立 port 和 log directory，不要重用上一次异常退出后的 rendezvous 端口。
++
++## 10. 验证
++
++- uni_rl CPU-safe focused suite：**57 passed, 20 skipped, 1 deselected**；
++- 新增 RoCE launcher 测试：**4 passed**；
++- Ruff：通过；
++- `git diff --check`：通过；
++- SAC / FlashSAC 双机 1000 轮：完成、checkpoint 正常、无 rank 分歧；
++- FlashSAC RoCE CUDA-event trace：完成，10 collective/iter，同步中位数 11.43 ms。
++
++## 11. 局限与后续建议
++
++1. SAC 已进入固定同步延迟主导区。若要从 1.65× 继续接近 2×，需要减少 optimizer
++   boundary（算法级的 delayed/batched sync）、使用更大/更重的 learner，或真正启用 GDR。
++   这些都不再是“无语义变更”，必须重新做收敛性对照。
++2. FlashSAC 的 1.89–1.92× 已接近当前无 GDR 软硬件栈的实用上限。优先修复
++   CUDA 12.1 PTXAS 工具链，可减少冷启日志噪声和 autotune 回退。
++3. 1000 轮质量实验证明学习没有被破坏；发布前若需要收敛级承诺，建议再跑
++   5000–10000 轮、至少 3 个 seed，报告均值和方差。
++4. 对其他 backend（MJWarp、Isaac Gym/Sim）要分别验证进程绑卡和外部 worker 的 CUDA
++   context；本报告的 RoCE 和 DP 结论可复用，但 MuJoCo collector 时间不可直接外推。
+diff --git a/docs/sphinx/source/en/2-user_guide/2-algorithms/5-multi-node-training.md b/docs/sphinx/source/en/2-user_guide/2-algorithms/5-multi-node-training.md
+index 28cfcb4a..73d72b4d 100644
+--- a/docs/sphinx/source/en/2-user_guide/2-algorithms/5-multi-node-training.md
++++ b/docs/sphinx/source/en/2-user_guide/2-algorithms/5-multi-node-training.md
+@@ -139,7 +139,9 @@ uv run --no-sync python scripts/launch_distributed.py \
+   --master-ip 192.168.100.1 \
+   --peer spark1 \
+   --num-nodes 2 \
+-  algo.num_envs=4096 algo.batch_size=8192
++  --nccl-transport ib \
++  --nccl-ib-hca rocep1s0f1 \
++  algo.num_envs=2048 algo.batch_size=8192 algo.policy_frequency=4
+ ```
+ 
+ ### 3.3 Command-line arguments
+@@ -156,8 +158,17 @@ uv run --no-sync python scripts/launch_distributed.py \
+ | `--remote-dir` | optional | UniLab path on peers (default `~/ws/motphys/UniLab`) |
+ | `--port` | optional | torchrun rendezvous port (default 29500) |
+ | `--dp-port` | optional | off-policy TCPStore port (default 29501) |
++| `--nccl-transport` | optional | `tcp` (safe default), `auto`, or `ib` for RoCE/InfiniBand |
++| `--nccl-ib-hca` | with `ib` | RDMA device name, for example `rocep1s0f1` |
+ | overrides | optional | Hydra overrides (e.g. `algo.num_envs=2048`) |
+ 
++On a direct 200 Gb/s DGX Spark link, `ib` avoids the socket staging path.
++The launcher also leaves P2P/SHM enabled for this one-GPU-per-node topology.
++The old TCP compatibility profile (`IB`, `P2P`, and `SHM` disabled) required
++about 43 ms of FlashSAC gradient synchronization per iteration; the validated
++RoCE profile requires a median 11.4 ms. Use the default `tcp` transport when
++the RDMA device is not active on both hosts.
++
+ Run `python scripts/launch_distributed.py --help` for the full reference.
+ 
+ ## Step 4: Verify training is running
+@@ -199,17 +210,17 @@ and `batch_size` as the single-node baseline), system throughput scales:
+ | --- | --- | --- |
+ | PPO g1_flip_tracking | 1024 envs | 1.78× |
+ | PPO go2_joystick_flat | 2048 envs | 1.93× |
+-| PPO g1_walk_flat | 2048 envs | 1.87× |
++| PPO g1_walk_flat | 2048 envs | 1.98× |
+ | PPO allegro_inhand | 16384 envs | 1.97× |
+-| FlashSAC g1_walk_flat | 4096 envs, batch 8192 | 1.91× |
++| FlashSAC g1_walk_flat | 2048 envs, batch 8192 | 1.89× (1.92× in 300-iter window) |
+ | FlashSAC g1_motion_tracking | 2048 envs, batch 8192 | 1.90× |
+-| SAC g1_walk_flat | 2048 envs, batch 8192 | 1.42× |
++| SAC g1_walk_flat | 2048 envs, batch 8192 | 1.65× |
+ 
+ Throughput approaches 2× as the learner compute weight grows (FlashSAC,
+ large-batch, large networks) or as the rollout load grows (more envs).
+-Lightweight learners (small MLP + small batch) are limited to ~1.4× by the
++Lightweight learners (small MLP + small batch) are limited to ~1.65× by the
+ fixed cost of gradient synchronization. See the
+-[dual-Spark throughput report](https://github.com/Motphys/UniLab/blob/feat/dual-spark/docs/reports/dual_spark_2026-09.md)
++[dual-Spark optimization report](../../../../../reports/dual_spark_optimization_2026-10.md)
+ for full measurements.
+ 
+ ## Manual launch (without the script)
+diff --git a/docs/sphinx/source/zh_CN/2-user_guide/2-algorithms/5-multi-node-training.md b/docs/sphinx/source/zh_CN/2-user_guide/2-algorithms/5-multi-node-training.md
+index 47865427..d50aa4c6 100644
+--- a/docs/sphinx/source/zh_CN/2-user_guide/2-algorithms/5-multi-node-training.md
++++ b/docs/sphinx/source/zh_CN/2-user_guide/2-algorithms/5-multi-node-training.md
+@@ -132,7 +132,9 @@ uv run --no-sync python scripts/launch_distributed.py \
+   --master-ip 192.168.100.1 \
+   --peer spark1 \
+   --num-nodes 2 \
+-  algo.num_envs=4096 algo.batch_size=8192
++  --nccl-transport ib \
++  --nccl-ib-hca rocep1s0f1 \
++  algo.num_envs=2048 algo.batch_size=8192 algo.policy_frequency=4
+ ```
+ 
+ ### 3.3 命令行参数
+@@ -149,8 +151,15 @@ uv run --no-sync python scripts/launch_distributed.py \
+ | `--remote-dir` | 可选 | 远端 UniLab 路径（默认 `~/ws/motphys/UniLab`） |
+ | `--port` | 可选 | torchrun 端口（默认 29500） |
+ | `--dp-port` | 可选 | off-policy TCPStore 端口（默认 29501） |
++| `--nccl-transport` | 可选 | `tcp`（安全默认）、`auto` 或用于 RoCE/InfiniBand 的 `ib` |
++| `--nccl-ib-hca` | 使用 `ib` 时 | RDMA 设备名，如 `rocep1s0f1` |
+ | overrides | 可选 | Hydra 参数透传（如 `algo.num_envs=2048`） |
+ 
++在 DGX Spark 200 Gb/s 直连环境中，`ib` 可避免 socket staging。该启动方式还会在
++“每节点单 GPU”拓扑下保持 P2P/SHM 开启。旧 TCP 兼容配置（禁用
++IB/P2P/SHM）下 FlashSAC 每轮梯度同步约需 43 ms；验证后的 RoCE
++配置中位数为 11.4 ms。若两台主机的 RDMA 设备未激活，请使用默认 `tcp` 传输。
++
+ 运行 `python scripts/launch_distributed.py --help` 查看完整帮助。
+ 
+ ## 第四步：验证训练正在运行
+@@ -191,16 +200,16 @@ cat logs/<run-dir>/run_summary.json | python -m json.tool | grep -E 'status|worl
+ | --- | --- | --- |
+ | PPO g1_flip_tracking | 1024 envs | 1.78× |
+ | PPO go2_joystick_flat | 2048 envs | 1.93× |
+-| PPO g1_walk_flat | 2048 envs | 1.87× |
++| PPO g1_walk_flat | 2048 envs | 1.98× |
+ | PPO allegro_inhand | 16384 envs | 1.97× |
+-| FlashSAC g1_walk_flat | 4096 envs, batch 8192 | 1.91× |
++| FlashSAC g1_walk_flat | 2048 envs, batch 8192 | 1.89×（300 轮窗口 1.92×） |
+ | FlashSAC g1_motion_tracking | 2048 envs, batch 8192 | 1.90× |
+-| SAC g1_walk_flat | 2048 envs, batch 8192 | 1.42× |
++| SAC g1_walk_flat | 2048 envs, batch 8192 | 1.65× |
+ 
+ 吞吐随 learner 计算重量（FlashSAC、大 batch、大网络）或 rollout 负载
+ （更多 env）的增长而接近 2×。轻量 learner（小 MLP + 小 batch）受梯度
+-同步固定开销限制约 1.4×。详见
+-[双 Spark 吞吐报告](https://github.com/Motphys/UniLab/blob/feat/dual-spark/docs/reports/dual_spark_2026-09.md)。
++同步固定开销限制约 1.65×。详见
++[双 Spark 优化报告](../../../../../reports/dual_spark_optimization_2026-10.md)。
+ 
+ ## 手动启动（不使用脚本）
+ 
+diff --git a/scripts/launch_distributed.py b/scripts/launch_distributed.py
+index 7cdad929..032aa616 100755
+--- a/scripts/launch_distributed.py
++++ b/scripts/launch_distributed.py
+@@ -47,6 +47,16 @@ def _build_parser() -> argparse.ArgumentParser:
+                          help="torchrun rendezvous port (default: 29500)")
+     cluster.add_argument("--dp-port", type=int, default=29501,
+                          help="off-policy TCPStore port (default: 29501)")
++    cluster.add_argument(
++        "--nccl-transport",
++        choices=["tcp", "auto", "ib"],
++        default="tcp",
++        help="NCCL network transport (default: tcp; use ib for RoCE/InfiniBand)",
++    )
++    cluster.add_argument(
++        "--nccl-ib-hca",
++        help="RDMA device for --nccl-transport=ib (for example rocep1s0f1)",
++    )
+     cluster.add_argument("--log-dir", default=None)
+     cluster.add_argument("--remote-dir", default="~/ws/motphys/UniLab",
+                          help="UniLab checkout path on peer hosts (default: ~/ws/motphys/UniLab)")
+@@ -65,6 +75,8 @@ def _validate(args: argparse.Namespace) -> None:
+         missing.append("--master-ip")
+     if len(args.peer) != args.num_nodes - 1:
+         missing.append(f"--peer (expected {args.num_nodes - 1}, got {len(args.peer)})")
++    if args.nccl_transport == "ib" and not args.nccl_ib_hca:
++        missing.append("--nccl-ib-hca (required for --nccl-transport=ib)")
+     if missing:
+         raise SystemExit(
+             f"error: multi-node mode requires: {', '.join(missing)}\n"
+@@ -93,9 +105,28 @@ def _launch_single(args: argparse.Namespace, log_dir: str) -> int:
+     return subprocess.run(cmd, check=False).returncode
+ 
+ 
++def _nccl_env(args: argparse.Namespace) -> dict[str, str]:
++    """Build an explicit, reproducible NCCL transport environment."""
++    env = {"NCCL_SOCKET_IFNAME": args.ifname}
++    if args.nccl_transport == "tcp":
++        env["NCCL_IB_DISABLE"] = "1"
++    elif args.nccl_transport == "ib":
++        env.update(
++            {
++                "NCCL_IB_DISABLE": "0",
++                "NCCL_IB_HCA": args.nccl_ib_hca,
++                # Multi-node one-GPU-per-host runs have no local peer edge.
++                # Explicitly reproduce the validated DGX Spark RoCE profile.
++                "NCCL_P2P_DISABLE": "0",
++                "NCCL_SHM_DISABLE": "0",
++            }
++        )
++    return env
++
++
+ def _peer_ssh_command(args: argparse.Namespace, rank: int, log_dir: str) -> str:
+     overrides = " ".join(f"'{o}'" for o in _hydra_args(args, log_dir))
+-    nccl = f"NCCL_IB_DISABLE=1 NCCL_SOCKET_IFNAME={args.ifname}"
++    nccl = " ".join(f"{key}={value}" for key, value in _nccl_env(args).items())
+     cd = f"cd {args.remote_dir} &&"
+     py = ".venv/bin/python"
+ 
+@@ -129,7 +160,8 @@ def _launch_multi(args: argparse.Namespace, log_dir: str) -> int:
+             start_new_session=True,
+         ))
+ 
+-    env = dict(os.environ, NCCL_IB_DISABLE="1", NCCL_SOCKET_IFNAME=args.ifname)
++    env = dict(os.environ)
++    env.update(_nccl_env(args))
+     if args.algo == "ppo":
+         cmd = [
+             sys.executable, "-m", "torch.distributed.run",
+diff --git a/tests/test_launch_distributed.py b/tests/test_launch_distributed.py
+new file mode 100644
+index 00000000..e739e203
+--- /dev/null
++++ b/tests/test_launch_distributed.py
+@@ -0,0 +1,56 @@
++from __future__ import annotations
++
++import pytest
++
++from scripts import launch_distributed
++
++
++def _args(*extra: str):
++    return launch_distributed._build_parser().parse_args(
++        [
++            "--algo",
++            "sac",
++            "--task",
++            "g1_walk_flat",
++            "--num-nodes",
++            "2",
++            "--ifname",
++            "enp1s0f1np1",
++            "--master-ip",
++            "10.77.0.1",
++            "--peer",
++            "10.77.0.2",
++            *extra,
++        ]
++    )
++
++
++def test_nccl_tcp_transport_keeps_compatibility_default() -> None:
++    assert launch_distributed._nccl_env(_args()) == {
++        "NCCL_SOCKET_IFNAME": "enp1s0f1np1",
++        "NCCL_IB_DISABLE": "1",
++    }
++
++
++def test_nccl_ib_transport_enables_rdma_and_peer_paths() -> None:
++    args = _args("--nccl-transport", "ib", "--nccl-ib-hca", "rocep1s0f1")
++    launch_distributed._validate(args)
++
++    assert launch_distributed._nccl_env(args) == {
++        "NCCL_SOCKET_IFNAME": "enp1s0f1np1",
++        "NCCL_IB_DISABLE": "0",
++        "NCCL_IB_HCA": "rocep1s0f1",
++        "NCCL_P2P_DISABLE": "0",
++        "NCCL_SHM_DISABLE": "0",
++    }
++
++
++def test_nccl_ib_transport_requires_hca() -> None:
++    with pytest.raises(SystemExit, match="--nccl-ib-hca"):
++        launch_distributed._validate(_args("--nccl-transport", "ib"))
++
++
++def test_nccl_auto_transport_only_pins_socket_interface() -> None:
++    assert launch_distributed._nccl_env(_args("--nccl-transport", "auto")) == {
++        "NCCL_SOCKET_IFNAME": "enp1s0f1np1"
++    }
+-- 
+2.53.0
+

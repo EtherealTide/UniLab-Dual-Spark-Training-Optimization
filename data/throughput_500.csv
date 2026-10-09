@@ -1,0 +1,9 @@
+algorithm,task,per_node_envs,batch_size,updates_per_step,single_iteration_ms,dual_iteration_ms,single_env_steps_s,dual_global_env_steps_s,single_learner_rows_s,dual_global_learner_rows_s,speedup,window
+ppo,g1_walk_flat,2048,,,,,49160.65,83567.30,,,1.70,50:500
+ppo,g1_flip_tracking,1024,,,,,22861.84,43038.46,,,1.88,50:500
+ppo,go2_joystick_flat,2048,,,,,66808.68,133751.39,,,2.00,50:500
+ppo,allegro_inhand,16384,,,,,42643.60,91439.72,,,2.14,50:500
+sac,g1_walk_flat,2048,8192,8,53.22,64.19,38496.57,64022.10,1231354,2041779,1.66,50:500
+sac,g1_motion_tracking,2048,8192,8,72.00,80.01,28471.35,51320.66,910271,1638196,1.80,50:500
+flashsac,g1_walk_flat,2048,8192,8,234.27,249.18,8742.86,16474.44,279748,526023,1.88,50:500
+flashsac,g1_motion_tracking,2048,8192,8,245.13,260.43,8355.22,15759.63,267349,503298,1.89,50:500

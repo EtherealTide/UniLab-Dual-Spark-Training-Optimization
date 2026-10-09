@@ -1,0 +1,9 @@
+algorithm,task,single_mean_reward,single_mean_episode_length,dual_mean_reward,dual_mean_episode_length,quality_window
+ppo,g1_walk_flat,1.02,76.70,25.04,890.35,last_20
+ppo,g1_flip_tracking,22.09,190.72,19.22,141.28,last_20
+ppo,go2_joystick_flat,53.38,1000.00,54.01,1000.00,last_20
+ppo,allegro_inhand,3.10,133.85,11.74,399.63,last_20
+sac,g1_walk_flat,16.91,67.67,17.22,70.02,last_20
+sac,g1_motion_tracking,-0.034,32.44,-0.073,33.94,last_20
+flashsac,g1_walk_flat,4.45,47.87,4.14,48.30,last_20
+flashsac,g1_motion_tracking,1.13,36.99,1.14,37.89,last_20

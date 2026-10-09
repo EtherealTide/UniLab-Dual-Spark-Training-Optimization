@@ -1,0 +1,17 @@
+run_name,host,mode,algorithm,task,world_size,num_envs,batch_size,updates_per_step,max_iterations,port
+ppo_single_g1_walk_500,host1,single,ppo,g1_walk_flat,1,2048,,,500,
+ppo_dual_g1_walk_500,host0,dual,ppo,g1_walk_flat,2,2048,,,500,29704
+ppo_single_g1_flip_500,host0,single,ppo,g1_flip_tracking,1,1024,,,500,
+ppo_dual_g1_flip_500,host0,dual,ppo,g1_flip_tracking,2,1024,,,500,29706
+ppo_single_go2_500,host0,single,ppo,go2_joystick_flat,1,2048,,,500,
+ppo_dual_go2_500,host0,dual,ppo,go2_joystick_flat,2,2048,,,500,29705
+ppo_single_allegro_500,host1,single,ppo,allegro_inhand,1,16384,,,500,
+ppo_dual_allegro_500,host0,dual,ppo,allegro_inhand,2,16384,,,500,29707
+sac_single_g1_walk_500,host0,single,sac,g1_walk_flat,1,2048,8192,8,500,
+sac_dual_g1_walk_500,host0,dual,sac,g1_walk_flat,2,2048,8192,8,500,29700
+sac_single_g1_motion_500,host0,single,sac,g1_motion_tracking,1,2048,8192,8,500,
+sac_dual_g1_motion_500,host0,dual,sac,g1_motion_tracking,2,2048,8192,8,500,29701
+flashsac_single_g1_walk_500,host0,single,flashsac,g1_walk_flat,1,2048,8192,8,500,
+flashsac_dual_g1_walk_500,host0,dual,flashsac,g1_walk_flat,2,2048,8192,8,500,29702
+flashsac_single_g1_motion_500,host0,single,flashsac,g1_motion_tracking,1,2048,8192,8,500,
+flashsac_dual_g1_motion_500,host0,dual,flashsac,g1_motion_tracking,2,2048,8192,8,500,29703

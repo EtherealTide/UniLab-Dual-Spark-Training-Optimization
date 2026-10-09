@@ -1,0 +1,791 @@
+From 385a69f6d74bcfd9453bd2ed0c2d0687ae6c5556 Mon Sep 17 00:00:00 2001
+From: EtherealTide <22371160@buaa.edu.cn>
+Date: Thu, 8 Oct 2026 14:06:18 +0800
+Subject: [PATCH] perf(dp): optimize dual-node CUDA graph synchronization
+
+---
+ src/uni_rl/algos/fast_sac/learner.py  | 116 ++++++++++--
+ src/uni_rl/algos/flash_sac/learner.py | 263 +++++++++++++++++++-------
+ src/uni_rl/ipc/dp_sync.py             |  38 +++-
+ tests/algos/test_fast_sac_compile.py  |  51 +++++
+ tests/algos/test_flash_sac_learner.py |  57 +++++-
+ tests/ipc/test_dp_sync.py             |  29 +++
+ 6 files changed, 452 insertions(+), 102 deletions(-)
+
+diff --git a/src/uni_rl/algos/fast_sac/learner.py b/src/uni_rl/algos/fast_sac/learner.py
+index fb50b22..7d10f0c 100644
+--- a/src/uni_rl/algos/fast_sac/learner.py
++++ b/src/uni_rl/algos/fast_sac/learner.py
+@@ -464,6 +464,21 @@ class FastSACLearner(LearnerBoilerplateMixin):
+             (), device=device, dtype=torch.float32, requires_grad=True
+         )
+         self._gradient_loss_flag.grad = torch.zeros_like(self._gradient_loss_flag)
++        self._critic_gradient_loss_flag = torch.empty(
++            (), device=device, dtype=torch.float32, requires_grad=True
++        )
++        self._critic_gradient_loss_flag.grad = torch.zeros_like(
++            self._critic_gradient_loss_flag
++        )
++        self._alpha_gradient_loss_flag = torch.empty(
++            (), device=device, dtype=torch.float32, requires_grad=True
++        )
++        self._alpha_gradient_loss_flag.grad = torch.zeros_like(
++            self._alpha_gradient_loss_flag
++        )
++        setattr(self._gradient_loss_flag, "_uni_rl_dp_copy_gradient", True)
++        setattr(self._critic_gradient_loss_flag, "_uni_rl_dp_copy_gradient", True)
++        setattr(self._alpha_gradient_loss_flag, "_uni_rl_dp_copy_gradient", True)
+         self.nvtx_profile_ranges = bool(nvtx_profile_ranges) and self._device_type == "cuda"
+         self.amp_dtype = amp_dtype
+         self._amp_dtype = self._resolve_amp_dtype(amp_dtype, self._device_type)
+@@ -702,6 +717,36 @@ class FastSACLearner(LearnerBoilerplateMixin):
+         sentinel.grad.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
+         self._sync_gradients((*parameters, sentinel))
+ 
++    def _fuse_critic_alpha_dp(self) -> bool:
++        """Whether critic and temperature can share one exact DP collective."""
++        return (
++            self.use_autotune
++            and self._gradient_sync is not None
++            and self._device_type == "cuda"
++            and not self._host_finite_checks
++            and self.scaler is None
++        )
++
++    def _sync_critic_alpha_gradients(
++        self,
++        critic_loss: torch.Tensor,
++        alpha_loss: torch.Tensor,
++    ) -> None:
++        """Average independent critic/temperature gradients in one bucket."""
++        critic_flag = self._critic_gradient_loss_flag
++        alpha_flag = self._alpha_gradient_loss_flag
++        assert critic_flag.grad is not None and alpha_flag.grad is not None
++        critic_flag.grad.copy_(torch.logical_not(torch.isfinite(critic_loss.detach()).all()))
++        alpha_flag.grad.copy_(torch.logical_not(torch.isfinite(alpha_loss.detach()).all()))
++        self._sync_gradients(
++            (
++                *self.qnet.parameters(),
++                self.log_alpha,
++                critic_flag,
++                alpha_flag,
++            )
++        )
++
+     def normalize_obs(self, obs: torch.Tensor, update: bool = False) -> torch.Tensor:
+         """Normalize actor observations using running statistics."""
+         if isinstance(self.obs_normalizer, nn.Identity):
+@@ -716,6 +761,8 @@ class FastSACLearner(LearnerBoilerplateMixin):
+         self,
+         optimizer: optim.Optimizer,
+         loss: torch.Tensor,
++        *,
++        loss_flag: torch.Tensor | None = None,
+     ) -> None:
+         """Arm a persistent, graph-safe fused-optimizer finite gate.
+ 
+@@ -728,9 +775,10 @@ class FastSACLearner(LearnerBoilerplateMixin):
+             return
+         found_inf = self._optimizer_found_inf
+         if self._gradient_sync is not None:
+-            assert self._gradient_loss_flag.grad is not None
++            sentinel = self._gradient_loss_flag if loss_flag is None else loss_flag
++            assert sentinel.grad is not None
+             if self.scaler is None:
+-                found_inf.copy_(self._gradient_loss_flag.grad > 0)
++                found_inf.copy_(sentinel.grad > 0)
+             else:
+                 found_inf.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
+             gradients = [
+@@ -1198,6 +1246,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
+                 truncated,
+             )
+ 
++        fuse_dp_updates = self._fuse_critic_alpha_dp()
+         # Skip if NaN
+         if self._finite_check_ok(qf_loss, read_metrics):
+             self._zero_optimizer_gradients(self.q_optimizer)
+@@ -1219,17 +1268,20 @@ class FastSACLearner(LearnerBoilerplateMixin):
+             else:
+                 with _cuda_nvtx_range("critic/backward", self.nvtx_profile_ranges):
+                     qf_loss.backward()
+-                self._sync_loss_gradients(self.qnet.parameters(), qf_loss)
+-                if self.max_grad_norm > 0:
+-                    with _cuda_nvtx_range("critic/grad_clip", self.nvtx_profile_ranges):
+-                        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+-                            self.qnet.parameters(), max_norm=self.max_grad_norm
+-                        )
+-                else:
+-                    critic_grad_norm = self._zero_metric
+-                with _cuda_nvtx_range("critic/q_optimizer_step", self.nvtx_profile_ranges):
+-                    self._arm_optimizer_finite_gate(self.q_optimizer, qf_loss)
+-                    self.q_optimizer.step()
++                if not fuse_dp_updates:
++                    self._sync_loss_gradients(self.qnet.parameters(), qf_loss)
++                    if self.max_grad_norm > 0:
++                        with _cuda_nvtx_range("critic/grad_clip", self.nvtx_profile_ranges):
++                            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
++                                self.qnet.parameters(), max_norm=self.max_grad_norm
++                            )
++                    else:
++                        critic_grad_norm = self._zero_metric
++                    with _cuda_nvtx_range(
++                        "critic/q_optimizer_step", self.nvtx_profile_ranges
++                    ):
++                        self._arm_optimizer_finite_gate(self.q_optimizer, qf_loss)
++                        self.q_optimizer.step()
+         else:
+             critic_grad_norm = self._zero_metric
+ 
+@@ -1243,10 +1295,40 @@ class FastSACLearner(LearnerBoilerplateMixin):
+             if self._finite_check_ok(alpha_loss, read_metrics):
+                 with _cuda_nvtx_range("critic/alpha_backward", self.nvtx_profile_ranges):
+                     alpha_loss.backward()
+-                self._sync_loss_gradients((self.log_alpha,), alpha_loss)
+-                with _cuda_nvtx_range("critic/alpha_optimizer_step", self.nvtx_profile_ranges):
+-                    self._arm_optimizer_finite_gate(self.alpha_optimizer, alpha_loss)
+-                    self.alpha_optimizer.step()
++                if fuse_dp_updates:
++                    self._sync_critic_alpha_gradients(qf_loss, alpha_loss)
++                    if self.max_grad_norm > 0:
++                        with _cuda_nvtx_range("critic/grad_clip", self.nvtx_profile_ranges):
++                            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
++                                self.qnet.parameters(), max_norm=self.max_grad_norm
++                            )
++                    else:
++                        critic_grad_norm = self._zero_metric
++                    with _cuda_nvtx_range(
++                        "critic/q_optimizer_step", self.nvtx_profile_ranges
++                    ):
++                        self._arm_optimizer_finite_gate(
++                            self.q_optimizer,
++                            qf_loss,
++                            loss_flag=self._critic_gradient_loss_flag,
++                        )
++                        self.q_optimizer.step()
++                    with _cuda_nvtx_range(
++                        "critic/alpha_optimizer_step", self.nvtx_profile_ranges
++                    ):
++                        self._arm_optimizer_finite_gate(
++                            self.alpha_optimizer,
++                            alpha_loss,
++                            loss_flag=self._alpha_gradient_loss_flag,
++                        )
++                        self.alpha_optimizer.step()
++                else:
++                    self._sync_loss_gradients((self.log_alpha,), alpha_loss)
++                    with _cuda_nvtx_range(
++                        "critic/alpha_optimizer_step", self.nvtx_profile_ranges
++                    ):
++                        self._arm_optimizer_finite_gate(self.alpha_optimizer, alpha_loss)
++                        self.alpha_optimizer.step()
+ 
+         if not read_metrics:
+             self._pending_cycle_critic_metric_values = torch.stack(
+diff --git a/src/uni_rl/algos/flash_sac/learner.py b/src/uni_rl/algos/flash_sac/learner.py
+index 3205670..4bc0b38 100644
+--- a/src/uni_rl/algos/flash_sac/learner.py
++++ b/src/uni_rl/algos/flash_sac/learner.py
+@@ -226,6 +226,29 @@ class FlashSACLearner(LearnerBoilerplateMixin):
+             device_gated=self._device_type == "cuda" and self.use_compile,
+         )
+         self._gradient_sync: Callable[[Iterable[torch.Tensor]], None] | None = None
++        self._gradient_graph_hooks: tuple[Callable[[], None], ...] | None = None
++        self._gradient_loss_flag = torch.empty(
++            (), device=self.device, dtype=torch.float32, requires_grad=True
++        )
++        self._gradient_loss_flag.grad = torch.zeros_like(self._gradient_loss_flag)
++        self._actor_gradient_loss_flag = torch.empty(
++            (), device=self.device, dtype=torch.float32, requires_grad=True
++        )
++        self._actor_gradient_loss_flag.grad = torch.zeros_like(
++            self._actor_gradient_loss_flag
++        )
++        self._temperature_gradient_loss_flag = torch.empty(
++            (), device=self.device, dtype=torch.float32, requires_grad=True
++        )
++        self._temperature_gradient_loss_flag.grad = torch.zeros_like(
++            self._temperature_gradient_loss_flag
++        )
++        # The same sentinel participates in all three optimizer buckets, so it
++        # cannot alias one persistent flat buffer.  It is only one scalar; keep
++        # it on the copy path while model gradients use zero-copy bucket views.
++        setattr(self._gradient_loss_flag, "_uni_rl_dp_copy_gradient", True)
++        setattr(self._actor_gradient_loss_flag, "_uni_rl_dp_copy_gradient", True)
++        setattr(self._temperature_gradient_loss_flag, "_uni_rl_dp_copy_gradient", True)
+         self.actor = FlashSACActor(
+             num_blocks=actor_num_blocks,
+             input_dim=obs_dim,
+@@ -403,11 +426,70 @@ class FlashSACLearner(LearnerBoilerplateMixin):
+                 torch.cuda.synchronize(self.device)
+ 
+     def set_gradient_sync(self, sync: Callable[[Iterable[torch.Tensor]], None] | None) -> None:
+-        """Attach the compatibility-device DP reduction."""
+-        if sync is not None and self._compile_full_update_cycle:
+-            raise RuntimeError("FlashSAC NVIDIA CUDA whole-cycle mode does not support DP fallback")
++        """Attach gradient averaging at each optimizer boundary."""
++        if sync != self._gradient_sync:
++            self._reset_update_cycle_graph()
++            self._gradient_graph_hooks = None
+         self._gradient_sync = sync
+ 
++    def set_gradient_graph_hooks(
++        self,
++        begin_capture: Callable[[], None],
++        end_capture: Callable[[], None],
++        before_replay: Callable[[], None],
++    ) -> None:
++        """Register DP instrumentation at the whole-cycle graph boundaries."""
++        hooks = (begin_capture, end_capture, before_replay)
++        if hooks != self._gradient_graph_hooks:
++            self._reset_update_cycle_graph()
++        self._gradient_graph_hooks = hooks
++
++    def _sync_loss_gradients(self, parameters: Iterable[torch.Tensor], loss: torch.Tensor) -> None:
++        """Average gradients and make the finite-loss gate rank-consistent."""
++        if (
++            self._gradient_sync is None
++            or self._device_type != "cuda"
++            or self._host_finite_checks
++            or self.scaler is not None
++        ):
++            self._sync_gradients(parameters)
++            return
++        sentinel = self._gradient_loss_flag
++        assert sentinel.grad is not None
++        sentinel.grad.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
++        self._sync_gradients((*parameters, sentinel))
++
++    def _fuse_actor_temperature_dp(self) -> bool:
++        """Whether actor and temperature can share one exact DP collective."""
++        return (
++            self._gradient_sync is not None
++            and self._device_type == "cuda"
++            and not self._host_finite_checks
++            and self.scaler is None
++        )
++
++    def _sync_actor_temperature_gradients(
++        self,
++        actor_loss: torch.Tensor,
++        temperature_loss: torch.Tensor,
++    ) -> None:
++        """Average independent actor/temperature gradients in one flat bucket."""
++        actor_flag = self._actor_gradient_loss_flag
++        temperature_flag = self._temperature_gradient_loss_flag
++        assert actor_flag.grad is not None and temperature_flag.grad is not None
++        actor_flag.grad.copy_(torch.logical_not(torch.isfinite(actor_loss.detach()).all()))
++        temperature_flag.grad.copy_(
++            torch.logical_not(torch.isfinite(temperature_loss.detach()).all())
++        )
++        self._sync_gradients(
++            (
++                *self.actor.parameters(),
++                *self.temperature.parameters(),
++                actor_flag,
++                temperature_flag,
++            )
++        )
++
+     def _compile_training_methods(self) -> None:
+         compile_fn = get_torch_compile_for_cuda(self.device, warn=True)
+         if compile_fn is None:
+@@ -493,13 +575,20 @@ class FlashSACLearner(LearnerBoilerplateMixin):
+         self,
+         optimizer: optim.Optimizer,
+         loss: torch.Tensor,
++        *,
++        loss_flag: torch.Tensor | None = None,
+     ) -> None:
+         """Arm a persistent graph-safe gate for fused CUDA Adam."""
+         if self._host_finite_checks or self._device_type != "cuda":
+             return
+         found_inf = self._optimizer_found_inf
+-        found_inf.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
+         if self._gradient_sync is not None:
++            sentinel = self._gradient_loss_flag if loss_flag is None else loss_flag
++            assert sentinel.grad is not None
++            if self.scaler is None:
++                found_inf.copy_(sentinel.grad > 0)
++            else:
++                found_inf.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
+             gradients = [
+                 parameter.grad
+                 for group in optimizer.param_groups
+@@ -512,6 +601,8 @@ class FlashSACLearner(LearnerBoilerplateMixin):
+                     found_inf,
+                     self._optimizer_grad_scale,
+                 )
++        else:
++            found_inf.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
+         if optimizer is self.critic_optimizer:
+             self._critic_update_finite.copy_(torch.logical_not(found_inf.detach()))
+         setattr(optimizer, "grad_scale", self._optimizer_grad_scale)
+@@ -679,13 +770,13 @@ class FlashSACLearner(LearnerBoilerplateMixin):
+         if self._finite_check_ok(critic_loss, read_metrics):
+             if self.scaler is not None:
+                 self.scaler.scale(critic_loss).backward()
+-                self._sync_gradients(self.critic.parameters())
++                self._sync_loss_gradients(self.critic.parameters(), critic_loss)
+                 self.scaler.unscale_(self.critic_optimizer)
+                 self.scaler.step(self.critic_optimizer)
+                 self.scaler.update()
+             else:
+                 critic_loss.backward()
+-                self._sync_gradients(self.critic.parameters())
++                self._sync_loss_gradients(self.critic.parameters(), critic_loss)
+                 self._arm_optimizer_finite_gate(self.critic_optimizer, critic_loss)
+                 self._stage_update_cycle_lr(self.critic_optimizer)
+                 self.critic_optimizer.step()
+@@ -733,33 +824,55 @@ class FlashSACLearner(LearnerBoilerplateMixin):
+             critic_obs,
+         )
+ 
++        fuse_dp_updates = self._fuse_actor_temperature_dp()
+         self._zero_optimizer_gradients(self.actor_optimizer)
+         if self._finite_check_ok(actor_loss, read_metrics):
+             if self.scaler is not None:
+                 self.scaler.scale(actor_loss).backward()
+-                self._sync_gradients(self.actor.parameters())
++                self._sync_loss_gradients(self.actor.parameters(), actor_loss)
+                 self.scaler.unscale_(self.actor_optimizer)
+                 self.scaler.step(self.actor_optimizer)
+                 self.scaler.update()
+             else:
+                 actor_loss.backward(inputs=list(self.actor.parameters()))
+-                self._sync_gradients(self.actor.parameters())
+-                self._arm_optimizer_finite_gate(self.actor_optimizer, actor_loss)
+-                self._stage_update_cycle_lr(self.actor_optimizer)
+-                self.actor_optimizer.step()
+-        if not self._capture_update_cycle:
+-            self.actor_scheduler.step()
+-        self.actor.normalize_parameters()
++                if not fuse_dp_updates:
++                    self._sync_loss_gradients(self.actor.parameters(), actor_loss)
++                    self._arm_optimizer_finite_gate(self.actor_optimizer, actor_loss)
++                    self._stage_update_cycle_lr(self.actor_optimizer)
++                    self.actor_optimizer.step()
++        if not fuse_dp_updates:
++            if not self._capture_update_cycle:
++                self.actor_scheduler.step()
++            self.actor.normalize_parameters()
+ 
+         temp_value = self.temperature()
+         temp_loss = temp_value * (entropy - self.target_entropy)
+         self._zero_optimizer_gradients(self.temperature_optimizer)
+         if self._finite_check_ok(temp_loss, read_metrics):
+             temp_loss.backward(inputs=list(self.temperature.parameters()))
+-            self._sync_gradients(self.temperature.parameters())
+-            self._arm_optimizer_finite_gate(self.temperature_optimizer, temp_loss)
++            if fuse_dp_updates:
++                self._sync_actor_temperature_gradients(actor_loss, temp_loss)
++                self._arm_optimizer_finite_gate(
++                    self.actor_optimizer,
++                    actor_loss,
++                    loss_flag=self._actor_gradient_loss_flag,
++                )
++                self._stage_update_cycle_lr(self.actor_optimizer)
++                self.actor_optimizer.step()
++                self._arm_optimizer_finite_gate(
++                    self.temperature_optimizer,
++                    temp_loss,
++                    loss_flag=self._temperature_gradient_loss_flag,
++                )
++            else:
++                self._sync_loss_gradients(self.temperature.parameters(), temp_loss)
++                self._arm_optimizer_finite_gate(self.temperature_optimizer, temp_loss)
+             self._stage_update_cycle_lr(self.temperature_optimizer)
+             self.temperature_optimizer.step()
++        if fuse_dp_updates:
++            if not self._capture_update_cycle:
++                self.actor_scheduler.step()
++            self.actor.normalize_parameters()
+         if not self._capture_update_cycle:
+             self.temperature_scheduler.step()
+ 
+@@ -1040,66 +1153,68 @@ class FlashSACLearner(LearnerBoilerplateMixin):
+             key: value.detach().clone() for key, value in large_batch.items()
+         }
+         static_batch = self._update_cycle_static_batch
+-        self._warm_update_cycle_graph(
+-            static_batch,
+-            updates_per_step=updates_per_step,
+-            policy_frequency=policy_frequency,
+-            target_frequency=target_frequency,
+-            policy_before_critic=policy_before_critic,
+-        )
+-        self._prepare_update_cycle_lr_specs(
+-            updates_per_step=updates_per_step,
+-            policy_frequency=policy_frequency,
+-        )
+-        self._fill_update_cycle_lr_specs(zero=False)
+-        saved_groups = [
+-            [group["lr"] for group in optimizer.param_groups]
+-            for optimizer in (
+-                self.critic_optimizer,
+-                self.actor_optimizer,
+-                self.temperature_optimizer,
+-            )
+-        ]
+-        graph = torch.cuda.CUDAGraph()
++        hooks = self._gradient_graph_hooks
++        if hooks is not None:
++            hooks[0]()
+         try:
+-            self._capture_update_cycle = True
+-            # thread_local: with the legacy "global" mode, a capture-unsafe CUDA
+-            # call from ANY thread (replay ingress daemon, in-process sim
+-            # backend, ...) silently invalidates the capture. The graph only
+-            # records this thread's update-cycle work, so thread_local is both
+-            # correct and robust against unrelated background CUDA activity.
+-            with (
+-                torch.cuda.device(self.device),
+-                torch.cuda.graph(
+-                    graph,
+-                    capture_error_mode=os.environ.get("UNI_RL_CAPTURE_ERROR_MODE", "thread_local"),
+-                ),
+-            ):
+-                self._run_update_cycle_core(
+-                    static_batch,
+-                    updates_per_step=updates_per_step,
+-                    policy_frequency=policy_frequency,
+-                    target_frequency=target_frequency,
+-                    policy_before_critic=policy_before_critic,
+-                )
+-        except torch.AcceleratorError:
+-            # Capture only records kernels without executing them, so a failed
+-            # capture leaves training state untouched. Warn once and fall back
+-            # to running the update cycle eagerly for the rest of training;
+-            # the compiled objectives stay active, only graph replay is lost.
+-            self._update_cycle_capture_failed = True
+-            self._update_cycle_graph = None
+-            warnings.warn(
+-                "FlashSAC whole-cycle CUDA graph capture failed; falling back to "
+-                "eager update-cycle execution for the rest of training.",
+-                stacklevel=2,
++            self._warm_update_cycle_graph(
++                static_batch,
++                updates_per_step=updates_per_step,
++                policy_frequency=policy_frequency,
++                target_frequency=target_frequency,
++                policy_before_critic=policy_before_critic,
+             )
+-            return
++            self._prepare_update_cycle_lr_specs(
++                updates_per_step=updates_per_step,
++                policy_frequency=policy_frequency,
++            )
++            self._fill_update_cycle_lr_specs(zero=False)
++            saved_groups = [
++                [group["lr"] for group in optimizer.param_groups]
++                for optimizer in (
++                    self.critic_optimizer,
++                    self.actor_optimizer,
++                    self.temperature_optimizer,
++                )
++            ]
++            graph = torch.cuda.CUDAGraph()
++            try:
++                self._capture_update_cycle = True
++                # thread_local: unrelated CUDA work on collector/ingress threads
++                # must not invalidate the learner graph capture.
++                with (
++                    torch.cuda.device(self.device),
++                    torch.cuda.graph(
++                        graph,
++                        capture_error_mode=os.environ.get(
++                            "UNI_RL_CAPTURE_ERROR_MODE", "thread_local"
++                        ),
++                    ),
++                ):
++                    self._run_update_cycle_core(
++                        static_batch,
++                        updates_per_step=updates_per_step,
++                        policy_frequency=policy_frequency,
++                        target_frequency=target_frequency,
++                        policy_before_critic=policy_before_critic,
++                    )
++            except torch.AcceleratorError:
++                self._update_cycle_capture_failed = True
++                self._update_cycle_graph = None
++                warnings.warn(
++                    "FlashSAC whole-cycle CUDA graph capture failed; falling back to "
++                    "eager update-cycle execution for the rest of training.",
++                    stacklevel=2,
++                )
++                return
++            finally:
++                self._capture_update_cycle = False
++                self._restore_update_cycle_group_lrs(saved_groups)
++            self._update_cycle_graph = graph
++            self._update_cycle_graph_metric_values = self._pending_cycle_metric_values
+         finally:
+-            self._capture_update_cycle = False
+-            self._restore_update_cycle_group_lrs(saved_groups)
+-        self._update_cycle_graph = graph
+-        self._update_cycle_graph_metric_values = self._pending_cycle_metric_values
++            if hooks is not None:
++                hooks[1]()
+ 
+     def update_cycle(
+         self,
+@@ -1140,6 +1255,8 @@ class FlashSACLearner(LearnerBoilerplateMixin):
+             return
+         assert self._update_cycle_graph is not None
+         self._fill_update_cycle_lr_specs(zero=False)
++        if self._gradient_graph_hooks is not None:
++            self._gradient_graph_hooks[2]()
+         self._update_cycle_graph.replay()
+         self._advance_update_cycle_schedulers()
+         self._pending_cycle_metric_values = self._update_cycle_graph_metric_values
+diff --git a/src/uni_rl/ipc/dp_sync.py b/src/uni_rl/ipc/dp_sync.py
+index 3b47b3d..02546f0 100644
+--- a/src/uni_rl/ipc/dp_sync.py
++++ b/src/uni_rl/ipc/dp_sync.py
+@@ -93,15 +93,16 @@ class DpParameterSync:
+         and without the pin every rank defaults to cuda:0, which hangs the
+         first collective on any rank whose learner lives on another GPU.
+ 
+-        ``NCCL_P2P_DISABLE``/``NCCL_SHM_DISABLE`` default to 1 (env override
+-        wins): on hosts with broken NCCL peer transport (e.g. RTX 6000D on
+-        current drivers, where P2P hangs and SHM triggers CUDA illegal
+-        memory access) the TCP loopback transport is the only reliable
+-        path.
++        Single-host FileStore launches default ``NCCL_P2P_DISABLE`` and
++        ``NCCL_SHM_DISABLE`` to 1 (explicit environment values win): this is
++        the compatibility path for hosts whose local peer transport is broken.
++        Multi-node TCPStore launches do not set either variable.  A one-GPU
++        node has no local peer edge to protect, and forcing P2P off was measured
++        to serialize/stage cross-node RoCE collectives on DGX Spark.
+         """
+         if self._started:
+             return
+-        if self.backend == "nccl":
++        if self.backend == "nccl" and self.rendezvous_path is not None:
+             import os
+ 
+             os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+@@ -177,23 +178,42 @@ class DpParameterSync:
+         ):
+             packed = torch.empty(gradient_numel, device=device, dtype=dtype)
+             self._gradient_buffers[buffer_key] = packed
++        # Whole-cycle CUDA graphs keep every optimizer gradient at a stable
++        # address.  During graph warmup, bind those gradients directly to
++        # non-overlapping views of the collective buffer.  Subsequent graph
++        # captures/replays then reduce the backward output in place and avoid
++        # one pack plus one unpack kernel per parameter, per optimizer update.
++        # Compatibility paths still use ordinary copies because
++        # ``zero_grad(set_to_none=True)`` is allowed to replace their storage.
++        use_bucket_views = self._capturing_gradient_graph
+         offset = 0
++        gradient_views: list[bool] = []
+         for parameter in params:
+             width = parameter.numel()
+             gradient = parameter.grad
+             assert gradient is not None
+-            packed[offset : offset + width].copy_(gradient.detach().reshape(-1))
++            packed_slice = packed[offset : offset + width].view_as(parameter)
++            is_bucket_view = gradient.data_ptr() == packed_slice.data_ptr()
++            if use_bucket_views and not getattr(parameter, "_uni_rl_dp_copy_gradient", False):
++                if not is_bucket_view:
++                    packed_slice.copy_(gradient.detach())
++                    parameter.grad = packed_slice
++                is_bucket_view = True
++            elif not is_bucket_view:
++                packed_slice.copy_(gradient.detach())
++            gradient_views.append(is_bucket_view)
+             offset += width
+ 
+         dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+         packed.div_(self.world_size)
+ 
+         offset = 0
+-        for parameter in params:
++        for parameter, is_bucket_view in zip(params, gradient_views, strict=True):
+             width = parameter.numel()
+             gradient = parameter.grad
+             assert gradient is not None
+-            gradient.copy_(packed[offset : offset + width].view_as(parameter))
++            if not is_bucket_view:
++                gradient.copy_(packed[offset : offset + width].view_as(parameter))
+             offset += width
+ 
+         if timing_events is not None:
+diff --git a/tests/algos/test_fast_sac_compile.py b/tests/algos/test_fast_sac_compile.py
+index f8fe5ba..1de4ec3 100644
+--- a/tests/algos/test_fast_sac_compile.py
++++ b/tests/algos/test_fast_sac_compile.py
+@@ -184,6 +184,57 @@ def test_dp_nonfinite_loss_with_finite_gradients_arms_same_gate(optimizer_name,
+         assert torch.isfinite(parameter.grad).all()
+ 
+ 
++def test_fast_sac_fuses_critic_and_alpha_dp_with_independent_loss_flags(monkeypatch):
++    learner = _small_fast_sac_learner()
++    learner._device_type = "cuda"  # Exercise graph-safe DP math with CPU tensors.
++    learner._host_finite_checks = False
++    for parameter in learner.qnet.parameters():
++        parameter.grad = torch.ones_like(parameter)
++    learner.log_alpha.grad = torch.ones_like(learner.log_alpha)
++    synchronized: list[torch.Tensor] = []
++
++    def average(parameters):
++        synchronized.extend(parameters)
++        assert synchronized[-2] is learner._critic_gradient_loss_flag
++        assert synchronized[-1] is learner._alpha_gradient_loss_flag
++        # Model the other rank reporting the inverse validity state. Both
++        # optimizers must therefore observe a global non-finite condition.
++        synchronized[-2].grad.add_(1.0).div_(2)
++        synchronized[-1].grad.add_(1.0).div_(2)
++
++    learner.set_gradient_sync(average)
++    assert learner._fuse_critic_alpha_dp() is True
++    learner._sync_critic_alpha_gradients(
++        torch.tensor(float("inf")),
++        torch.tensor(1.0),
++    )
++
++    q_parameters = list(learner.qnet.parameters())
++    assert len(synchronized[:-3]) == len(q_parameters)
++    assert all(
++        actual is expected
++        for actual, expected in zip(synchronized[:-3], q_parameters, strict=True)
++    )
++    assert synchronized[-3] is learner.log_alpha
++    monkeypatch.setattr(
++        torch,
++        "_amp_foreach_non_finite_check_and_unscale_",
++        lambda *_args: None,
++    )
++    learner._arm_optimizer_finite_gate(
++        learner.q_optimizer,
++        torch.tensor(float("inf")),
++        loss_flag=learner._critic_gradient_loss_flag,
++    )
++    assert learner._optimizer_found_inf.item() > 0
++    learner._arm_optimizer_finite_gate(
++        learner.alpha_optimizer,
++        torch.tensor(1.0),
++        loss_flag=learner._alpha_gradient_loss_flag,
++    )
++    assert learner._optimizer_found_inf.item() > 0
++
++
+ def test_gradient_graph_capture_hook_ends_when_warmup_fails(monkeypatch):
+     learner = _small_fast_sac_learner()
+     events = []
+diff --git a/tests/algos/test_flash_sac_learner.py b/tests/algos/test_flash_sac_learner.py
+index 671e4a8..26b28a9 100644
+--- a/tests/algos/test_flash_sac_learner.py
++++ b/tests/algos/test_flash_sac_learner.py
+@@ -109,14 +109,65 @@ def test_flashsac_cuda_adam_optimizers_are_capturable(monkeypatch) -> None:
+     assert all(call["capturable"] for call in calls)
+ 
+ 
+-def test_flashsac_gradient_sync_rejects_dp_in_whole_cycle_mode() -> None:
++def test_flashsac_gradient_sync_invalidates_whole_cycle_graph() -> None:
+     learner = _make_small_learner()
+     learner._compile_full_update_cycle = True
++    learner._update_cycle_graph = object()  # type: ignore[assignment]
+ 
+-    with pytest.raises(RuntimeError, match="does not support DP fallback"):
+-        learner.set_gradient_sync(lambda _parameters: None)
++    learner.set_gradient_sync(lambda _parameters: None)
+ 
+     assert learner.use_update_cycle is True
++    assert learner._gradient_sync is not None
++    assert learner._update_cycle_graph is None
++
++
++def test_flashsac_fuses_actor_temperature_dp_with_independent_loss_flags(monkeypatch) -> None:
++    learner = _make_small_learner()
++    learner._device_type = "cuda"  # Exercise graph-safe DP math with CPU tensors.
++    learner._host_finite_checks = False
++    for parameter in learner.actor.parameters():
++        parameter.grad = torch.ones_like(parameter)
++    for parameter in learner.temperature.parameters():
++        parameter.grad = torch.ones_like(parameter)
++    synchronized: list[torch.Tensor] = []
++
++    def average(parameters):
++        synchronized.extend(parameters)
++        assert synchronized[-2] is learner._actor_gradient_loss_flag
++        assert synchronized[-1] is learner._temperature_gradient_loss_flag
++        synchronized[-2].grad.add_(1.0).div_(2)
++        synchronized[-1].grad.add_(1.0).div_(2)
++
++    learner.set_gradient_sync(average)
++    assert learner._fuse_actor_temperature_dp() is True
++    learner._sync_actor_temperature_gradients(
++        torch.tensor(float("inf")),
++        torch.tensor(1.0),
++    )
++
++    model_parameters = [*learner.actor.parameters(), *learner.temperature.parameters()]
++    assert len(synchronized[:-2]) == len(model_parameters)
++    assert all(
++        actual is expected
++        for actual, expected in zip(synchronized[:-2], model_parameters, strict=True)
++    )
++    monkeypatch.setattr(
++        torch,
++        "_amp_foreach_non_finite_check_and_unscale_",
++        lambda *_args: None,
++    )
++    learner._arm_optimizer_finite_gate(
++        learner.actor_optimizer,
++        torch.tensor(float("inf")),
++        loss_flag=learner._actor_gradient_loss_flag,
++    )
++    assert learner._optimizer_found_inf.item() > 0
++    learner._arm_optimizer_finite_gate(
++        learner.temperature_optimizer,
++        torch.tensor(1.0),
++        loss_flag=learner._temperature_gradient_loss_flag,
++    )
++    assert learner._optimizer_found_inf.item() > 0
+ 
+ 
+ def test_flashsac_update_cycle_rejects_compatibility_fallback() -> None:
+diff --git a/tests/ipc/test_dp_sync.py b/tests/ipc/test_dp_sync.py
+index 842f4c5..41cb622 100644
+--- a/tests/ipc/test_dp_sync.py
++++ b/tests/ipc/test_dp_sync.py
+@@ -302,6 +302,35 @@ def test_gradient_graph_counts_without_timing_events(tmp_path: Path, monkeypatch
+     assert sync.take_gradient_sync_metrics() == (0.0, 1)
+ 
+ 
++def test_gradient_graph_warmup_binds_persistent_bucket_views(tmp_path: Path, monkeypatch):
++    reduced = []
++
++    def fake_all_reduce(tensor, **_kwargs):
++        reduced.append(tensor)
++        tensor.mul_(2.0)
++
++    monkeypatch.setattr("uni_rl.ipc.dp_sync.dist.all_reduce", fake_all_reduce)
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++    sync = DpParameterSync(
++        world_size=2, rank=0, rendezvous_path=str(tmp_path / "unused"), backend="gloo"
++    )
++    first = torch.nn.Parameter(torch.ones(3))
++    second = torch.nn.Parameter(torch.full((2,), 2.0))
++    first.grad = torch.full_like(first, 3.0)
++    second.grad = torch.full_like(second, 4.0)
++
++    sync.begin_gradient_graph_capture(enable_timing=False)
++    sync.allreduce_gradients((first, second))
++
++    assert len(reduced) == 1
++    packed = reduced[0]
++    assert first.grad is not None and first.grad.data_ptr() == packed.data_ptr()
++    assert second.grad is not None
++    assert second.grad.data_ptr() == packed[3:].data_ptr()
++    assert torch.equal(first.grad, torch.full_like(first, 3.0))
++    assert torch.equal(second.grad, torch.full_like(second, 4.0))
++
++
+ def test_invalid_world_size_and_rank_are_rejected(tmp_path: Path):
+     path = str(tmp_path / "unused")
+     with pytest.raises(ValueError, match="world_size >= 2"):
+-- 
+2.53.0
+
