@@ -555,6 +555,142 @@ Use world size `1` for single-node runs; select `sac` or `flashsac` for the othe
 algorithms. For fixed-window throughput, use the extractor in step 4 with a
 manifest containing the new run name.
 
+### Record a video from an existing checkpoint
+
+The benchmark commands use `training.no_play=true`, so they save checkpoints
+without running post-training playback. To generate a video later, load a
+checkpoint with `training.play_only=true` and `training.play_render_mode=record`.
+This runs policy inference and simulation, without resuming training.
+
+Run playback once on the host that saved the checkpoint, normally HOST0/rank0.
+A checkpoint from dual-node training can be played on one Spark; no peer,
+rendezvous port, or distributed launcher is needed.
+
+From your local terminal, connect to HOST0:
+
+```bash
+ssh dgx1
+```
+
+Then prepare the shell **on the DGX**. Use your actual UniLab checkout path if
+it differs from the bootstrap default:
+
+```bash
+cd /home/nvidia/unilab-dual-spark-repro/UniLab
+export PATH="$HOME/.local/bin:$PATH"
+find "$PWD/logs" -type f -name 'model_*.pt' | sort
+
+# Clear distributed settings if this shell was used for a manual dual-node run.
+unset RANK LOCAL_RANK WORLD_SIZE LOCAL_WORLD_SIZE MASTER_ADDR MASTER_PORT
+unset UNILAB_DP_EXTERNAL UNILAB_DP_WORLD_SIZE UNILAB_DP_RANK
+unset UNILAB_DP_RENDEZVOUS_URL UNILAB_DP_LOG_DIR
+
+# Use GPU 0 and offscreen EGL rendering over SSH.
+export CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+```
+
+Select an existing checkpoint and the same algorithm, task, backend, and model
+configuration used in training. Use an absolute checkpoint path: the bundle's
+flat `logs/<run_name>` directories are outside UniLab's default task log tree.
+If training changed model or environment settings, carry those overrides into
+playback; `run_config.json` beside the checkpoint records the resolved settings.
+
+#### PPO: Go2 joystick
+
+PPO uses zero-based checkpoint indices: a 500-iteration run saves
+`model_499.pt`. Replace the run name below with the one you trained:
+
+```bash
+checkpoint="$PWD/logs/ppo_dual_go2_500/model_499.pt"
+test -f "$checkpoint" || { echo "Checkpoint not found: $checkpoint"; false; }
+```
+
+Continue only if that check succeeds:
+
+```bash
+uv run --no-sync src/unilab/scripts/train_rsl_rl.py \
+  task=go2_joystick_flat/mujoco "algo.load_run=$checkpoint" \
+  training.devices=null training.play_only=true training.no_play=false \
+  training.play_render_mode=record training.play_env_num=1 training.play_steps=500
+```
+
+#### SAC: G1 walk
+
+Off-policy checkpoint filenames use completed iteration counts, for example
+`model_500.pt`. Check the actual filename before running this example:
+
+```bash
+checkpoint="$PWD/logs/sac_dual_g1_walk_500/model_500.pt"
+test -f "$checkpoint" || { echo "Checkpoint not found: $checkpoint"; false; }
+```
+
+Continue only if that check succeeds:
+
+```bash
+uv run --no-sync src/unilab/scripts/train_sac.py \
+  task=g1_walk_flat/mujoco "algo.load_run=$checkpoint" \
+  training.devices=null training.play_only=true training.no_play=false \
+  training.play_render_mode=record training.play_env_num=1 training.play_steps=500 \
+  training.export_onnx=false training.trace_enabled=false
+```
+
+#### FlashSAC: G1 motion tracking
+
+```bash
+checkpoint="$PWD/logs/flashsac_dual_g1_motion_500/model_500.pt"
+test -f "$checkpoint" || { echo "Checkpoint not found: $checkpoint"; false; }
+```
+
+Continue only if that check succeeds:
+
+```bash
+uv run --no-sync src/unilab/scripts/train_flashsac.py \
+  task=g1_motion_tracking/mujoco "algo.load_run=$checkpoint" \
+  training.devices=null training.play_only=true training.no_play=false \
+  training.play_render_mode=record training.play_env_num=1 training.play_steps=500 \
+  training.export_onnx=false training.trace_enabled=false
+```
+
+`training.export_onnx=false` skips SAC/FlashSAC policy export while retaining
+video recording. The PPO entrypoint also exports policy files during playback.
+`training.play_env_num=1` records one environment; `training.play_steps` controls
+the finite rollout length. Use 20 steps for a quick recording check, then increase
+the length for a useful clip. Keep `--no-sync` to preserve the pinned environment.
+
+Each entrypoint writes `play_video.mp4` beside the selected checkpoint:
+
+```bash
+video="$(dirname "$checkpoint")/play_video.mp4"
+test -s "$video" && ls -lh "$video"
+```
+
+Repeated playback writes the same filename. Rename an existing video before
+recording again if you want to keep it. The checkpoint is loaded for inference;
+video recording does not update its weights.
+
+Playback was checked on dgx1 with existing PPO, SAC, and FlashSAC checkpoint
+copies, using EGL, one environment, and 20 steps. All three produced decodable
+1280×720 H.264 MP4 files. These checks validate recording, not policy quality.
+
+#### Download the MP4 to Windows
+
+Run these commands in **local Windows PowerShell**, after leaving the SSH
+session or opening another local terminal:
+
+```powershell
+$videoDir = Join-Path $env:USERPROFILE 'Downloads\UniLab-videos'
+New-Item -ItemType Directory -Force -Path $videoDir | Out-Null
+
+# Replace this with the DGX video path printed above.
+$remoteVideo = '/home/nvidia/unilab-dual-spark-repro/UniLab/logs/ppo_dual_go2_500/play_video.mp4'
+scp "dgx1:${remoteVideo}" (Join-Path $videoDir 'ppo_dual_go2_500.mp4')
+
+explorer "$videoDir"
+```
+
+Use `dgx2` if the video is on that host. `scp` uses the same SSH alias and
+authentication as `ssh`; choose a different local filename for each run.
+
 ## 4. Extract comparable absolute throughput
 
 Run on `HOST0`, in the bundle checkout. Set `REMOTE_ROOT` to the path used for
