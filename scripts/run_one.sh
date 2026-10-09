@@ -25,6 +25,7 @@ run_name=$5
 port=$6
 env_device=${7:-${ENV_DEVICE:-cuda}}
 max_iterations=${MAX_ITERATIONS:-500}
+uv_bin=${UV_BIN:-/home/nvidia/.local/bin/uv}
 
 for value in "$mode" "$algo" "$task" "$envs" "$run_name" "$port"; do
     if [[ ! $value =~ ^[A-Za-z0-9_.-]+$ ]]; then
@@ -44,9 +45,13 @@ if [[ $env_device != cpu && $env_device != cuda ]]; then
     echo "env_device must be cpu or cuda" >&2
     exit 2
 fi
+if [[ ! $envs =~ ^[0-9]+$ || ! $port =~ ^[0-9]+$ || ! $max_iterations =~ ^[0-9]+$ ]]; then
+    echo "envs, port, and MAX_ITERATIONS must be non-negative integers" >&2
+    exit 2
+fi
 
 remote_dir=$REMOTE_ROOT/UniLab
-python=.venv/bin/python
+python_cmd="$uv_bin run --no-sync python"
 common_args="task=$task/mujoco training.log_dir=logs/$run_name training.no_play=true training.env_device=$env_device algo.num_envs=$envs algo.max_iterations=$max_iterations"
 
 if [[ $algo == ppo ]]; then
@@ -62,7 +67,7 @@ fi
 
 if [[ $mode == single ]]; then
     ssh -F /dev/null "$HOST0" \
-        "cd $remote_dir && $python $entry $common_args $algo_args > /tmp/${run_name}_single.log 2>&1"
+        "cd $remote_dir && $python_cmd $entry $common_args $algo_args > /tmp/${run_name}_single.log 2>&1"
     echo "DONE:$run_name:0"
     exit 0
 fi
@@ -70,11 +75,11 @@ fi
 nccl_env="NCCL_IB_DISABLE=0 NCCL_IB_HCA=$NCCL_IB_HCA NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME NCCL_P2P_DISABLE=0 NCCL_SHM_DISABLE=0 NCCL_NET_GDR_LEVEL=SYS"
 
 if [[ $algo == ppo ]]; then
-    rank1_cmd="cd $remote_dir && env $nccl_env $python -m torch.distributed.run --nnodes=2 --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$port --node_rank=1 $entry $common_args > /tmp/${run_name}_rank1.log 2>&1"
-    rank0_cmd="cd $remote_dir && env $nccl_env $python -m torch.distributed.run --nnodes=2 --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$port --node_rank=0 $entry $common_args > /tmp/${run_name}_rank0.log 2>&1"
+    rank1_cmd="cd $remote_dir && env $nccl_env $python_cmd -m torch.distributed.run --nnodes=2 --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$port --node_rank=1 $entry $common_args > /tmp/${run_name}_rank1.log 2>&1"
+    rank0_cmd="cd $remote_dir && env $nccl_env $python_cmd -m torch.distributed.run --nnodes=2 --nproc_per_node=1 --master_addr=$MASTER_ADDR --master_port=$port --node_rank=0 $entry $common_args > /tmp/${run_name}_rank0.log 2>&1"
 else
-    rank1_cmd="cd $remote_dir && env $nccl_env UNILAB_DP_EXTERNAL=1 UNILAB_DP_WORLD_SIZE=2 UNILAB_DP_RANK=1 UNILAB_DP_RENDEZVOUS_URL=tcp://$MASTER_ADDR:$port UNILAB_DP_LOG_DIR=logs/$run_name $python $entry $common_args $algo_args > /tmp/${run_name}_rank1.log 2>&1"
-    rank0_cmd="cd $remote_dir && env $nccl_env UNILAB_DP_EXTERNAL=1 UNILAB_DP_WORLD_SIZE=2 UNILAB_DP_RANK=0 UNILAB_DP_RENDEZVOUS_URL=tcp://$MASTER_ADDR:$port UNILAB_DP_LOG_DIR=logs/$run_name $python $entry $common_args $algo_args > /tmp/${run_name}_rank0.log 2>&1"
+    rank1_cmd="cd $remote_dir && env $nccl_env UNILAB_DP_EXTERNAL=1 UNILAB_DP_WORLD_SIZE=2 UNILAB_DP_RANK=1 UNILAB_DP_RENDEZVOUS_URL=tcp://$MASTER_ADDR:$port UNILAB_DP_LOG_DIR=logs/$run_name $python_cmd $entry $common_args $algo_args > /tmp/${run_name}_rank1.log 2>&1"
+    rank0_cmd="cd $remote_dir && env $nccl_env UNILAB_DP_EXTERNAL=1 UNILAB_DP_WORLD_SIZE=2 UNILAB_DP_RANK=0 UNILAB_DP_RENDEZVOUS_URL=tcp://$MASTER_ADDR:$port UNILAB_DP_LOG_DIR=logs/$run_name $python_cmd $entry $common_args $algo_args > /tmp/${run_name}_rank0.log 2>&1"
 fi
 
 ssh -F /dev/null "$HOST1" "$rank1_cmd" &

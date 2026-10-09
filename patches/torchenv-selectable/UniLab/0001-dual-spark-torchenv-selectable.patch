@@ -60050,6 +60050,60 @@ index 168240ef..ec930a94 100644
      summaries: list[_AssetSummary] = []
      for directory, marker, pattern, label in ROBOT_ASSET_SPECS[robot]:
          target = resolve_robot_asset_dir(directory, marker=marker, show_progress=False)
+diff --git a/src/unilab/assets/robots/allegro_hand/allegro_right.xml b/src/unilab/assets/robots/allegro_hand/allegro_right.xml
+index ff23fbde..b6c9813a 100644
+--- a/src/unilab/assets/robots/allegro_hand/allegro_right.xml
++++ b/src/unilab/assets/robots/allegro_hand/allegro_right.xml
+@@ -1,5 +1,5 @@
+ <mujoco model="allegro_right">
+-  <compiler angle="radian" meshdir="assets" autolimits="true"/>
++  <compiler angle="radian" meshdir="." autolimits="true"/>
+ 
+   <option cone="elliptic" impratio="40" noslip_iterations="5" noslip_tolerance="1e-6"/>
+ 
+@@ -114,17 +114,17 @@
+     <material name="black" rgba="0.2 0.2 0.2 1"/>
+     <material name="white" rgba="0.9 0.9 0.9 1"/>
+ 
+-    <mesh file="base_link.stl"/>
+-    <mesh file="link_0.0.stl"/>
+-    <mesh file="link_1.0.stl"/>
+-    <mesh file="link_2.0.stl"/>
+-    <mesh file="link_3.0.stl"/>
+-    <mesh file="link_3.0_tip.stl"/>
+-    <mesh file="link_12.0_right.stl"/>
+-    <mesh file="link_13.0.stl"/>
+-    <mesh file="link_14.0.stl"/>
+-    <mesh file="link_15.0.stl"/>
+-    <mesh file="link_15.0_tip.stl"/>
++    <mesh file="assets/base_link.stl"/>
++    <mesh file="assets/link_0.0.stl"/>
++    <mesh file="assets/link_1.0.stl"/>
++    <mesh file="assets/link_2.0.stl"/>
++    <mesh file="assets/link_3.0.stl"/>
++    <mesh file="assets/link_3.0_tip.stl"/>
++    <mesh file="assets/link_12.0_right.stl"/>
++    <mesh file="assets/link_13.0.stl"/>
++    <mesh file="assets/link_14.0.stl"/>
++    <mesh file="assets/link_15.0.stl"/>
++    <mesh file="assets/link_15.0_tip.stl"/>
+   </asset>
+ 
+   <worldbody>
+diff --git a/src/unilab/assets/robots/allegro_hand/ball.xml b/src/unilab/assets/robots/allegro_hand/ball.xml
+index 187d08c7..c388418a 100644
+--- a/src/unilab/assets/robots/allegro_hand/ball.xml
++++ b/src/unilab/assets/robots/allegro_hand/ball.xml
+@@ -3,8 +3,7 @@
+     <texture name="tennis_tex" type="2d" file="assets/ycb/056_tennis_ball/google_16k/texture_map.png"/>
+     <material name="tennis_mat" texture="tennis_tex"/>
+ 
+-    <!-- meshdir is defined in allegro_right.xml -->
+-    <mesh name="tennis_ball" file="ycb/056_tennis_ball/google_16k/textured.obj" scale="1.1935 1.1935 1.1935"/>
++    <mesh name="tennis_ball" file="assets/ycb/056_tennis_ball/google_16k/textured.obj" scale="1.1935 1.1935 1.1935"/>
+   </asset>
+ 
+   <worldbody>
 diff --git a/src/unilab/assets/robots/g1/isaacsim/flat_floor_entity.xml b/src/unilab/assets/robots/g1/isaacsim/flat_floor_entity.xml
 new file mode 100644
 index 00000000..ea2b7f01
@@ -94431,10 +94485,46 @@ index 00000000..af0ea007
 +def test_migration_exception_list_remains_explicit() -> None:
 +    assert not _MIGRATION_DEBT_NODES
 diff --git a/tests/assets/test_hub.py b/tests/assets/test_hub.py
-index 664adf32..85c67339 100644
+index 664adf32..79bca8cf 100644
 --- a/tests/assets/test_hub.py
 +++ b/tests/assets/test_hub.py
-@@ -220,13 +220,13 @@ def test_resolve_robot_asset_dir_can_disable_snapshot_progress(tmp_path: Path):
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ from pathlib import Path
+ from unittest.mock import MagicMock, patch
++from xml.etree import ElementTree as ET
+ 
+ import numpy as np
+ import pytest
+@@ -15,6 +16,27 @@ from unilab.assets.hub import (
+     resolve_scene_dir,
+ )
+ 
++
++def test_allegro_included_assets_keep_explicit_scene_relative_paths():
++    """MjSpec serialization must not depend on an include-local meshdir."""
++    allegro_dir = ASSETS_ROOT_PATH / "robots" / "allegro_hand"
++    hand_root = ET.parse(allegro_dir / "allegro_right.xml").getroot()
++    ball_root = ET.parse(allegro_dir / "ball.xml").getroot()
++
++    compiler = hand_root.find("compiler")
++    assert compiler is not None
++    assert compiler.get("meshdir") == "."
++
++    resource_files = [
++        element.get("file")
++        for root in (hand_root, ball_root)
++        for element in root.findall(".//asset/*")
++        if element.get("file") is not None
++    ]
++    assert resource_files
++    assert all(path.startswith("assets/") for path in resource_files)
++
++
+ # ---------------------------------------------------------------------------
+ # Local-path fast path
+ # ---------------------------------------------------------------------------
+@@ -220,13 +242,13 @@ def test_resolve_robot_asset_dir_can_disable_snapshot_progress(tmp_path: Path):
  
      with patch("unilab.assets.hub.ASSETS_ROOT_PATH", tmp_path):
          with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
@@ -94450,7 +94540,7 @@ index 664adf32..85c67339 100644
      assert kwargs["local_dir"] == str(tmp_path)
      tqdm_class = kwargs["tqdm_class"]
      progress = tqdm_class(range(1))
-@@ -246,10 +246,8 @@ def test_robot_asset_specs_cover_hf_hosted_robots():
+@@ -246,10 +268,8 @@ def test_robot_asset_specs_cover_hf_hosted_robots():
      from unilab.assets.hub import ROBOT_ASSET_SPECS
  
      expected = {
@@ -94461,7 +94551,7 @@ index 664adf32..85c67339 100644
      }
      assert set(ROBOT_ASSET_SPECS) == expected
      for robot, specs in ROBOT_ASSET_SPECS.items():
-@@ -293,13 +291,14 @@ def test_ensure_robot_assets_handles_absolute_and_windows_paths(
+@@ -293,13 +313,14 @@ def test_ensure_robot_assets_handles_absolute_and_windows_paths(
      hub.ensure_robot_assets_for_paths(
          [
              "/home/user/project/src/unilab/assets/robots/go2/go2.xml",

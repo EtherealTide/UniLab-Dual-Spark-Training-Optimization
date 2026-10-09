@@ -18,7 +18,9 @@ FlashSAC 的 MuJoCo 任务。
 | 任务 | 每节点 env | 单机 steps/s | 双机总 steps/s | 加速比 |
 | --- | ---: | ---: | ---: | ---: |
 | `g1_walk_flat` | 2,048 | 49,160.65 | **83,567.30** | 1.70× |
+| `g1_flip_tracking` | 1,024 | 22,861.84 | **43,038.46** | 1.88× |
 | `go2_joystick_flat` | 2,048 | 66,808.68 | **133,751.39** | 2.00× |
+| `allegro_inhand` | 16,384 | 42,643.60 | **91,439.72** | 2.14× |
 本表仅保留旧版 NumPy baseline；TorchEnv CPU/GPU 的新鲜 500 轮结果写入
 `data/torchenv_selectable_500.csv`，没有完成的项明确标记为 `pending`，不会用 smoke 数字填充。
 
@@ -52,6 +54,7 @@ FlashSAC 的 MuJoCo 任务。
   `cuda:1` 被拒绝，避免多节点 rank-local ordinal 歧义。
 - Allegro action/observation/reward/termination/reset terms 改为 Torch-native；reset 仍通过
   UniSim 公共 transaction 边界提交，MuJoCo 物理保持 CPU-authoritative。
+- Allegro 资产路径改为 XML 内显式 `assets/...` 相对路径，干净安装不需要额外 symlink。
 - G1 motion/flip 的 MuJoCo owner 改用 `TensorMotionCommandCfg`，motion sampler 支持
   `start/clip_start/uniform/adaptive/mixed`。
 - UniSim 依赖在 `pyproject.toml` 与 `uv.lock` 中固定为 `==1.7.12`。
@@ -69,10 +72,10 @@ FlashSAC 的 MuJoCo 任务。
 
 | 项目 | 可复现版本 |
 | --- | --- |
-| UniLab | dual pin `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` + TorchEnv main source `5c8877ec6ec1bb0aba5c7682d6efdaed43fd49ee` 合并；集成提交 `d71875c0dc2bf8a054514b69547502664eb7b2e0`；包版本 `1.3.3` |
+| UniLab | dual pin `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` + TorchEnv main source `5c8877ec6ec1bb0aba5c7682d6efdaed43fd49ee` 合并；集成提交 `d6634baaf0f3baaff4b03954d285746bb5988149`；包版本 `1.3.3` |
 | UniSim | tag `v1.7.12`，commit `d082150631f16c8d3c8913281f62474cd9dffb93`，包版本 `unisim-core==1.7.12` |
 | unilab-rl | dual pin `a3ed997d5c25ff708d674778782bc1be08a53e15` + TorchEnv main source `8c5a322bac66d4e8150867f24913da3ab916dea3` 合并；集成提交 `a7f82c9476eaa61e97bf9ec6dd725f9a055ceb40`；包版本 `1.4.10` |
-| PyTorch | `2.9.0+cu130` |
+| PyTorch | `2.14.0+cu130` |
 | MuJoCo | `3.11.0` |
 
 这里明确区分“公开 `feat/dual-spark` 分支 pin”和“实际实验 tree”。UniLab patch 还包含
@@ -95,7 +98,7 @@ hash 都记录在 [`patches/README.md`](patches/README.md)，不会把本地实�
 └── scripts/
     ├── bootstrap.sh             # 克隆、打补丁、安装和版本校验
     ├── run_one.sh               # 单项单机/双机 500 轮复现
-    ├── run_matrix.sh            # 完整 16-run 矩阵
+    ├── run_matrix.sh            # 完整 32-run 矩阵
     └── extract_metrics.py       # TensorBoard 指标提取
 ```
 
@@ -105,7 +108,7 @@ hash 都记录在 [`patches/README.md`](patches/README.md)，不会把本地实�
 
 - NVIDIA DGX Spark / GB10，Ubuntu aarch64；
 - Python 3.12、`uv`、Git；
-- PyTorch 2.9.0+cu130；
+- PyTorch 2.14.0+cu130；
 - 200 Gb/s 直连接口，例如 `enp1s0f1np1`；
 - active RoCE HCA，例如 `rocep1s0f1`；
 - 相同代码路径和资产缓存；
@@ -190,7 +193,7 @@ bash scripts/run_matrix.sh
 ```
 
 该脚本按顺序运行 CPU/GPU 两种 carrier 下的完整任务矩阵，每个 carrier 为 16 个 run
-（8 个单机 + 8 个双机），耗时较长。每个 run 使用独立日志目录；
+（8 个单机 + 8 个双机），总计 32 个正式 run，耗时较长。每个 run 使用独立日志目录；
 rank 0 是唯一 TensorBoard/checkpoint 写入者。
 
 ## 4. 提取绝对吞吐

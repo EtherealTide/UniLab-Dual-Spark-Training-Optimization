@@ -26,7 +26,10 @@ CPU-authoritative，`training.env_device=cuda` 表示 Manager state、观测、r
 3. MuJoCo G1 motion/flip、SAC、FlashSAC owner 使用 `TensorMotionCommandCfg`；sampler 补齐
    `start`、`clip_start`、`uniform`、`adaptive`、`mixed` 五种模式。
 4. UniSim 依赖在 UniLab `pyproject.toml`/`uv.lock` 中从范围约束改为 `unisim-core==1.7.12`。
-5. `scripts/run_one.sh` 增加第七个参数 `cpu|cuda`；`run_matrix.sh` 对 PPO 四任务、SAC/
+5. Allegro include XML 中的 mesh/texture 改为显式 `assets/...` 相对路径，避免
+   UniSim 1.7.12 在 `MjSpec.to_xml()` 重序列化时丢失 include-local `meshdir`语义。
+   因此干净部署不再需要人工 symlink。
+6. `scripts/run_one.sh` 增加第七个参数 `cpu|cuda`；`run_matrix.sh` 对 PPO 四任务、SAC/
    FlashSAC 两任务执行 CPU/GPU × 单/双机矩阵。
 
 ## 3. 已完成门禁（不是 500 轮结果）

@@ -84,7 +84,7 @@ cd "$target_root/UniLab"
 "$uv_bin" pip install --python .venv/bin/python --no-deps -e "$target_root/UniSim"
 "$uv_bin" pip install --python .venv/bin/python --no-deps -e "$target_root/unilab_rl"
 
-.venv/bin/python - "$UNILAB_PACKAGE_VERSION" "$UNISIM_PACKAGE_VERSION" \
+"$uv_bin" run --no-sync python - "$UNILAB_PACKAGE_VERSION" "$UNISIM_PACKAGE_VERSION" \
     "$UNILAB_RL_PACKAGE_VERSION" "$TORCH_VERSION" "$MUJOCO_VERSION" <<'PY'
 import importlib.metadata as metadata
 import sys
