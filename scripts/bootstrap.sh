@@ -62,14 +62,14 @@ apply_pinned_patches \
     "$target_root/UniLab" \
     "$UNILAB_BRANCH_COMMIT" \
     "$UNILAB_INTEGRATION_TREE" \
-    "$bundle_root/patches/UniLab"
+    "$bundle_root/patches/torchenv-selectable/UniLab"
 
 clone_if_missing "$UNILAB_RL_REPO" "$target_root/unilab_rl"
 apply_pinned_patches \
     "$target_root/unilab_rl" \
     "$UNILAB_RL_BRANCH_COMMIT" \
     "$UNILAB_RL_INTEGRATION_TREE" \
-    "$bundle_root/patches/unilab_rl"
+    "$bundle_root/patches/torchenv-selectable/unilab_rl"
 
 clone_if_missing "$UNISIM_REPO" "$target_root/UniSim"
 git -C "$target_root/UniSim" fetch origin "$UNISIM_COMMIT"
