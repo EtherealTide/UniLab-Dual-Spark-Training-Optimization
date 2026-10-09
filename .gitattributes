@@ -2,3 +2,6 @@
 *.py text eol=lf
 *.awk text eol=lf
 *.md text eol=lf
+*.patch text eol=lf whitespace=-blank-at-eol
+versions.env text eol=lf
+SHA256SUMS text eol=lf

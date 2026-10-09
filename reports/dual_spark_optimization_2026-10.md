@@ -2,6 +2,14 @@
 
 日期：2026-10-08
 
+> **Interpretation update (2026-10-09):** The tables report weak scaling within
+> the optimized runtime. Historical off-policy iteration-time ratios include
+> runtime and workload changes and are not isolated optimization gains. PPO
+> dual-node absolute throughput changes by +2.39%, +4.07%, +0.93%, and -1.33%
+> versus September. Read the [comparison audit](historical_comparison_2026-10.md)
+> before drawing a code-performance or convergence conclusion. Original exported
+> measurements are retained unchanged.
+
 范围：PPO、SAC、FlashSAC；MuJoCo；G1 locomotion / motion tracking、Go2 joystick、
 Allegro in-hand；2 × NVIDIA DGX Spark（每机单卡）。
 
@@ -121,8 +129,11 @@ eager 兼容路径仍使用 copy。finite sentinel 明确标记为 copy-only，�
 | TCP，IB/P2P/SHM 禁用 | 10 | 43.36 ms | ~279.15 ms | ~14.67k |
 | RoCE，P2P/SHM 开启 | 10 | 11.43 ms 中位数 | 248.16 ms | 16.54k |
 
-同步中位数降低 **73.6%**。NCCL 日志确认 `NET/IB`、`rocep1s0f1`、
-200000 Mb/s。当前仍是 `GDR 0`，因此这一收益不依赖系统级 GDR 改动。
+These author-reported diagnostic observations change IB/P2P/SHM together.
+The old row does not specify its timing estimator, while 11.43 ms is a median;
+the previously stated 73.6% reduction is therefore not a verified like-for-like
+statistic. Raw A/B artifacts are not included in this bundle. Reported NCCL
+diagnostics show `NET/IB`, `rocep1s0f1`, 200000 Mb/s and `GDR 0`.
 
 ### 4.2 SAC collective 融合
 
@@ -131,8 +142,9 @@ eager 兼容路径仍使用 copy。finite sentinel 明确标记为 copy-only，�
 | 未融合 | 65.57 ms | 62.74k | 18 |
 | critic + alpha 融合 | 64.37 ms | 63.85k | 10 |
 
-吞吐提升约 1.8%。30 轮 smoke 的噪声足以覆盖该收益，因此最终决策基于
-250 个稳态 iteration，而不是最后一轮。
+The point observations differ by about 1.8%. This diagnostic A/B used a
+250-iteration steady window, but the raw artifacts and repeat-run uncertainty
+are not bundled; it does not establish a reproducible isolated gain yet.
 
 ### 4.3 绝对性能
 
@@ -143,8 +155,11 @@ eager 兼容路径仍使用 copy。finite sentinel 明确标记为 copy-only，�
 | FlashSAC g1_walk_flat | 901.4 ms | 234.27 ms | 945.4 ms | 249.18 ms |
 | FlashSAC g1_motion_tracking | 471.2 ms | 245.13 ms | 494.7 ms | 260.43 ms |
 
-FlashSAC 的绝对 iteration 时间下降约 1.9–3.8×。扩展比没有按同比例上升，
-是因为单机 learner 同时变得更快，通信的固定时间在总 iteration 中占比更高。
+The historical FlashSAC iteration-time ratios are about 1.9-3.8x, across changed
+runtime and workload configurations. FlashSAC walk changes from 4096 to 2048
+environments per rank, and update schedules require historical resolved configs
+for confirmation. These ratios cannot be attributed entirely to RoCE/DP.
+See the comparison audit for the separate integration patch and metric units.
 
 ## 5. 500 轮全任务实测
 
@@ -205,16 +220,17 @@ G1 walk 的 1.70×。
 | --- | ---: | ---: | --- |
 | PPO g1_walk_flat | 1.02 / 76.70 | 25.04 / 890.35 | 双机每轮全局样本翻倍，学习阶段显著超前 |
 | PPO g1_flip_tracking | 22.09 / 190.72 | 19.22 / 141.28 | 双机略低，但无发散；500 轮不足以判定收敛等价 |
-| PPO go2_joystick_flat | 53.38 / 1000 | 54.01 / 1000 | 等价 |
+| PPO go2_joystick_flat | 53.38 / 1000 | 54.01 / 1000 | Similar short-run metrics |
 | PPO allegro_inhand | 3.10 / 133.85 | 11.74 / 399.63 | 双机每轮样本翻倍，学习阶段显著超前 |
-| SAC g1_walk_flat | 16.91 / 67.67 | 17.22 / 70.02 | 等价 |
+| SAC g1_walk_flat | 16.91 / 67.67 | 17.22 / 70.02 | Similar short-run metrics |
 | SAC g1_motion_tracking | -0.034 / 32.44 | -0.073 / 33.94 | 同一早期学习区间 |
-| FlashSAC g1_walk_flat | 4.45 / 47.87 | 4.14 / 48.30 | 等价 |
-| FlashSAC g1_motion_tracking | 1.13 / 36.99 | 1.14 / 37.89 | 等价 |
+| FlashSAC g1_walk_flat | 4.45 / 47.87 | 4.14 / 48.30 | Similar short-run metrics |
+| FlashSAC g1_motion_tracking | 1.13 / 36.99 | 1.14 / 37.89 | Similar short-run metrics |
 
-这些 500 轮数据验证了优化没有破坏学习，但不替代 5000–10000 轮、多 seed 的
-收敛级评估。尤其是 G1 flip 和 G1 walk，在 500 轮内单/双机已进入不同学习阶段，
-不应要求同 iteration 下 reward 逐值一致。
+These 500-iteration observations show no reported instability in the measured
+runs. Similar short-run rewards do not establish learning or convergence
+equivalence. Multiple seeds and matched sample budgets are needed, especially
+when PPO single/dual policies enter different learning stages.
 
 ## 8. 失败实验和有限收益
 
@@ -270,8 +286,9 @@ PPO 双机：
 
 结论：
 
-1. RoCE + graph 内 DP + 持久 bucket view 把 FlashSAC 绝对性能提高约 1.9–3.8×，
-   并在 walk/motion 两个任务上都实现 1.88–1.89×扩展。
+1. The optimized configuration records 1.88-1.89x FlashSAC weak scaling across
+   walk/motion. Historical iteration-time reductions also include runtime and
+   workload changes; this report does not isolate a 1.9-3.8x optimization gain.
 2. SAC 的扩展率从 walk 的 1.66× 到 motion 的 1.80×，清晰验证了计算/通信比模型。
 3. PPO 在状态分布匹配的 Go2 上达到 2.00×；G1 walk 的 500 轮真实训练受
    策略阶段差异影响，全窗口为 1.70×。

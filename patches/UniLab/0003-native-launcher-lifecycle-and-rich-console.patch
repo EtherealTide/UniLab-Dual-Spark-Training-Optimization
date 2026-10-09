@@ -1,0 +1,907 @@
+diff --git a/scripts/launch_distributed.py b/scripts/launch_distributed.py
+index 032aa616..3816b6f1 100755
+--- a/scripts/launch_distributed.py
++++ b/scripts/launch_distributed.py
+@@ -13,13 +13,19 @@ Two nodes:
+ from __future__ import annotations
+ 
+ import argparse
++import base64
++import json
+ import os
++import queue
++import shlex
++import signal
+ import subprocess
+ import sys
++import threading
+ import time
++from pathlib import Path
+ from typing import Sequence
+ 
+-
+ _ENTRYPOINT = {
+     "ppo": "src/unilab/scripts/train_rsl_rl.py",
+     "sac": "src/unilab/scripts/train_sac.py",
+@@ -34,19 +40,26 @@ def _build_parser() -> argparse.ArgumentParser:
+     parser.add_argument("--algo", required=True, choices=["ppo", "sac", "flashsac"])
+     parser.add_argument("--task", required=True)
+     parser.add_argument("--sim", default="mujoco")
+-    parser.add_argument("overrides", nargs="*", default=[],
+-                        help="Hydra overrides (e.g. algo.num_envs=2048)")
++    parser.add_argument(
++        "overrides", nargs="*", default=[], help="Hydra overrides (e.g. algo.num_envs=2048)"
++    )
+ 
+     cluster = parser.add_argument_group("cluster (required when --num-nodes > 1)")
+     cluster.add_argument("-N", "--num-nodes", type=int, default=1)
+     cluster.add_argument("--ifname", help="QSFP interface name")
+     cluster.add_argument("--master-ip", help="spark0 (rank 0) IP on the QSFP link")
+-    cluster.add_argument("--peer", action="append", default=[],
+-                         help="SSH alias/IP of each peer (repeat for >2 nodes)")
+-    cluster.add_argument("--port", type=int, default=29500,
+-                         help="torchrun rendezvous port (default: 29500)")
+-    cluster.add_argument("--dp-port", type=int, default=29501,
+-                         help="off-policy TCPStore port (default: 29501)")
++    cluster.add_argument(
++        "--peer",
++        action="append",
++        default=[],
++        help="SSH alias/IP of each peer (repeat for >2 nodes)",
++    )
++    cluster.add_argument(
++        "--port", type=int, default=29500, help="torchrun rendezvous port (default: 29500)"
++    )
++    cluster.add_argument(
++        "--dp-port", type=int, default=29501, help="off-policy TCPStore port (default: 29501)"
++    )
+     cluster.add_argument(
+         "--nccl-transport",
+         choices=["tcp", "auto", "ib"],
+@@ -58,15 +71,28 @@ def _build_parser() -> argparse.ArgumentParser:
+         help="RDMA device for --nccl-transport=ib (for example rocep1s0f1)",
+     )
+     cluster.add_argument("--log-dir", default=None)
+-    cluster.add_argument("--remote-dir", default="~/ws/motphys/UniLab",
+-                         help="UniLab checkout path on peer hosts (default: ~/ws/motphys/UniLab)")
++    cluster.add_argument(
++        "--completion-timeout",
++        type=float,
++        default=60,
++        help="Seconds allowed for remaining ranks after the first successful exit",
++    )
++    cluster.add_argument(
++        "--remote-dir",
++        default="~/ws/motphys/UniLab",
++        help="UniLab checkout path on peer hosts (default: ~/ws/motphys/UniLab)",
++    )
+     return parser
+ 
+ 
+ def _validate(args: argparse.Namespace) -> None:
+     if args.num_nodes < 1:
+         raise SystemExit("error: --num-nodes must be >= 1")
++    if args.completion_timeout <= 0:
++        raise SystemExit("error: --completion-timeout must be positive")
+     if args.num_nodes == 1:
++        if args.peer:
++            raise SystemExit("error: --peer requires --num-nodes > 1")
+         return
+     missing = []
+     if not args.ifname:
+@@ -79,8 +105,7 @@ def _validate(args: argparse.Namespace) -> None:
+         missing.append("--nccl-ib-hca (required for --nccl-transport=ib)")
+     if missing:
+         raise SystemExit(
+-            f"error: multi-node mode requires: {', '.join(missing)}\n"
+-            "       see --help for details"
++            f"error: multi-node mode requires: {', '.join(missing)}\n       see --help for details"
+         )
+ 
+ 
+@@ -100,9 +125,7 @@ def _hydra_args(args: argparse.Namespace, log_dir: str) -> list[str]:
+ 
+ 
+ def _launch_single(args: argparse.Namespace, log_dir: str) -> int:
+-    cmd = [sys.executable, _ENTRYPOINT[args.algo], *_hydra_args(args, log_dir)]
+-    print(f"[launch] single-node: {' '.join(cmd[:3])}...")
+-    return subprocess.run(cmd, check=False).returncode
++    return _launch_managed(args, log_dir)
+ 
+ 
+ def _nccl_env(args: argparse.Namespace) -> dict[str, str]:
+@@ -125,81 +148,352 @@ def _nccl_env(args: argparse.Namespace) -> dict[str, str]:
+ 
+ 
+ def _peer_ssh_command(args: argparse.Namespace, rank: int, log_dir: str) -> str:
+-    overrides = " ".join(f"'{o}'" for o in _hydra_args(args, log_dir))
+-    nccl = " ".join(f"{key}={value}" for key, value in _nccl_env(args).items())
+-    cd = f"cd {args.remote_dir} &&"
+-    py = ".venv/bin/python"
+-
+-    if args.algo == "ppo":
+-        return (
+-            f"{cd} {nccl} {py} -m torch.distributed.run"
+-            f" --nnodes={args.num_nodes} --nproc_per_node=1"
+-            f" --master_addr={args.master_ip} --master_port={args.port}"
+-            f" --node_rank={rank}"
+-            f" {_ENTRYPOINT['ppo']} {overrides}"
+-        )
++    cmd, env = _rank_command(args, rank, log_dir, ".venv/bin/python")
++    spec = base64.b64encode(
++        json.dumps(
++            {
++                "cmd": cmd,
++                "env": env,
++                "log_dir": log_dir,
++                "rank": rank,
++            }
++        ).encode()
++    ).decode()
++    remote_dir = args.remote_dir
++    if remote_dir == "~" or remote_dir.startswith("~/"):
++        remote_dir = '"$HOME"' + shlex.quote(remote_dir[1:])
++    else:
++        remote_dir = shlex.quote(remote_dir)
+     return (
+-        f"{cd} {nccl}"
+-        f" UNILAB_DP_EXTERNAL=1 UNILAB_DP_WORLD_SIZE={args.num_nodes}"
+-        f" UNILAB_DP_RANK={rank}"
+-        f" UNILAB_DP_RENDEZVOUS_URL=tcp://{args.master_ip}:{args.dp_port}"
+-        f" UNILAB_DP_LOG_DIR={log_dir}"
+-        f" {py} {_ENTRYPOINT[args.algo]} {overrides}"
++        f"cd {remote_dir} && exec .venv/bin/python -u scripts/launch_distributed.py"
++        f" --worker-spec {shlex.quote(spec)}"
+     )
+ 
+ 
+ def _launch_multi(args: argparse.Namespace, log_dir: str) -> int:
+-    peers: list[subprocess.Popen] = []
+-    for rank, peer in enumerate(args.peer, start=1):
+-        ssh_cmd = _peer_ssh_command(args, rank, log_dir)
+-        print(f"[launch] rank {rank} -> {peer}")
+-        peers.append(subprocess.Popen(
+-            ["ssh", "-tt", peer, ssh_cmd],
+-            stdout=subprocess.DEVNULL,
+-            stderr=subprocess.DEVNULL,
+-            start_new_session=True,
+-        ))
++    return _launch_managed(args, log_dir)
++
+ 
+-    env = dict(os.environ)
+-    env.update(_nccl_env(args))
+-    if args.algo == "ppo":
++def _rank_command(
++    args: argparse.Namespace,
++    rank: int,
++    log_dir: str,
++    python: str,
++) -> tuple[list[str], dict[str, str]]:
++    env = {"PYTHONUNBUFFERED": "1"}
++    if args.num_nodes > 1:
++        env.update(_nccl_env(args))
++    if args.algo == "ppo" and args.num_nodes > 1:
+         cmd = [
+-            sys.executable, "-m", "torch.distributed.run",
+-            "--nnodes", str(args.num_nodes),
+-            "--nproc_per_node", "1",
+-            "--master_addr", args.master_ip,
+-            "--master_port", str(args.port),
+-            "--node_rank", "0",
++            python,
++            "-u",
++            "-m",
++            "torch.distributed.run",
++            "--nnodes",
++            str(args.num_nodes),
++            "--nproc_per_node",
++            "1",
++            "--master_addr",
++            args.master_ip,
++            "--master_port",
++            str(args.port),
++            "--node_rank",
++            str(rank),
+             _ENTRYPOINT["ppo"],
+             *_hydra_args(args, log_dir),
+         ]
+     else:
+-        env.update({
+-            "UNILAB_DP_EXTERNAL": "1",
+-            "UNILAB_DP_WORLD_SIZE": str(args.num_nodes),
+-            "UNILAB_DP_RANK": "0",
+-            "UNILAB_DP_RENDEZVOUS_URL": f"tcp://{args.master_ip}:{args.dp_port}",
+-            "UNILAB_DP_LOG_DIR": log_dir,
+-        })
+-        cmd = [sys.executable, _ENTRYPOINT[args.algo], *_hydra_args(args, log_dir)]
+-
+-    print(f"[launch] rank 0 local")
++        if args.num_nodes > 1:
++            env.update(
++                {
++                    "UNILAB_DP_EXTERNAL": "1",
++                    "UNILAB_DP_WORLD_SIZE": str(args.num_nodes),
++                    "UNILAB_DP_RANK": str(rank),
++                    "UNILAB_DP_RENDEZVOUS_URL": f"tcp://{args.master_ip}:{args.dp_port}",
++                    "UNILAB_DP_LOG_DIR": log_dir,
++                }
++            )
++        cmd = [python, "-u", _ENTRYPOINT[args.algo], *_hydra_args(args, log_dir)]
++    return cmd, env
++
++
++def _stop_group(proc: subprocess.Popen) -> None:
++    """Stop only the process group created for this rank, including collectors."""
++    try:
++        os.killpg(proc.pid, signal.SIGTERM)
++    except ProcessLookupError:
++        return
+     try:
+-        return subprocess.run(cmd, env=env, check=False).returncode
++        proc.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        pass
++    # A leader can exit before its children. Reap the remaining group as well.
++    try:
++        os.killpg(proc.pid, signal.SIGKILL)
++    except ProcessLookupError:
++        pass
++    proc.wait()
++
++
++def _pump(
++    proc: subprocess.Popen,
++    path: Path,
++    show: bool,
++    errors: queue.SimpleQueue,
++) -> threading.Thread:
++    logfile = path.open("xb", buffering=0)
++
++    def copy() -> None:
++        assert proc.stdout is not None
++        try:
++            while chunk := proc.stdout.read1(65536):
++                logfile.write(chunk)
++                if show:
++                    sys.stdout.buffer.write(chunk)
++                    sys.stdout.buffer.flush()
++        except Exception as exc:
++            errors.put(exc)
++        finally:
++            logfile.close()
++            proc.stdout.close()
++
++    thread = threading.Thread(target=copy, daemon=True)
++    thread.start()
++    return thread
++
++
++def _worker(encoded: str) -> int:
++    """Own a remote rank group; SSH stdin is a lease, never the user's TTY."""
++    spec = json.loads(base64.b64decode(encoded))
++    path = Path(spec["log_dir"]) / "launcher" / f"rank{spec['rank']}.log"
++    if Path(spec["log_dir"]).exists() and any(Path(spec["log_dir"]).iterdir()):
++        raise SystemExit("Remote run directory is not empty; choose a fresh --log-dir")
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if path.exists():
++        raise SystemExit(f"Refusing to overwrite {path}; choose a fresh --log-dir")
++    disconnected = threading.Event()
++
++    def watch_lease() -> None:
++        # Raw reads avoid holding BufferedReader's lock during interpreter exit.
++        while os.read(sys.stdin.fileno(), 1):
++            pass
++        disconnected.set()
++
++    threading.Thread(target=watch_lease, daemon=True).start()
++    proc = subprocess.Popen(
++        spec["cmd"],
++        env={**os.environ, **spec["env"]},
++        stdin=subprocess.DEVNULL,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        start_new_session=True,
++    )
++    errors: queue.SimpleQueue = queue.SimpleQueue()
++    pump = None
++    try:
++        pump = _pump(proc, path, True, errors)
++        while proc.poll() is None:
++            if not errors.empty():
++                raise RuntimeError("Cannot save remote rank log") from errors.get()
++            if disconnected.wait(0.1):
++                print("[launch] coordinator disconnected; stopping remote rank", flush=True)
++                return 143
++        _stop_group(proc)
++        pump.join(timeout=5)
++        if not errors.empty():
++            raise RuntimeError("Cannot save remote rank log") from errors.get()
++        code = _exit_code(proc.returncode)
++        marker = f"[launch] rank{spec['rank']} exited (code={code})"
++        with path.open("ab") as logfile:
++            logfile.write((marker + "\n").encode())
++        print(marker, flush=True)
++        return code
++    finally:
++        _stop_group(proc)
++        if pump is not None:
++            pump.join(timeout=5)
++
++
++def _exit_code(code: int) -> int:
++    return code if code >= 0 else 128 - code
++
++
++def _launch_managed(args: argparse.Namespace, log_dir: str) -> int:
++    root = Path(log_dir) / "launcher"
++    if Path(log_dir).exists() and any(Path(log_dir).iterdir()):
++        raise SystemExit("Run directory is not empty; choose a fresh --log-dir")
++    root.mkdir(parents=True, exist_ok=True)
++    if any(root.glob("rank*.log")):
++        raise SystemExit("Run logs already exist; choose a fresh --log-dir")
++    processes: list[subprocess.Popen] = []
++    pumps: list[threading.Thread] = []
++    reported: set[int] = set()
++    errors: queue.SimpleQueue = queue.SimpleQueue()
++    first_exit = None
++    old_handlers = {}
++
++    def interrupted(signum: int, frame: object) -> None:
++        raise KeyboardInterrupt
++
++    for signum in (signal.SIGINT, signal.SIGTERM):
++        old_handlers[signum] = signal.signal(signum, interrupted)
++
++    try:
++        cmd, extra_env = _rank_command(args, 0, log_dir, sys.executable)
++        # Keep Rich colors in a real terminal even though rank0 is tee'd to disk.
++        extra_env["UNILAB_CONSOLE_TTY"] = "1" if sys.stdout.isatty() else "0"
++        proc = subprocess.Popen(
++            cmd,
++            env={**os.environ, **extra_env},
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            start_new_session=True,
++        )
++        processes.append(proc)
++        pumps.append(_pump(proc, root / "rank0.log", True, errors))
++        print(
++            f"[launch] rank0 log: tail -n 40 -F {shlex.quote(str(root / 'rank0.log'))}", flush=True
++        )
++        for rank, peer in enumerate(args.peer, start=1):
++            proc = subprocess.Popen(
++                [
++                    "ssh",
++                    "-T",
++                    "-o",
++                    "BatchMode=yes",
++                    "-o",
++                    "ConnectTimeout=10",
++                    "-o",
++                    "ServerAliveInterval=10",
++                    "-o",
++                    "ServerAliveCountMax=3",
++                    peer,
++                    _peer_ssh_command(args, rank, log_dir),
++                ],
++                # Hold an isolated pipe open as the remote worker's lifetime lease.
++                stdin=subprocess.PIPE,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT,
++                start_new_session=True,
++            )
++            processes.append(proc)
++            path = root / f"rank{rank}.log"
++            pumps.append(_pump(proc, path, False, errors))
++            print(
++                f"[launch] rank{rank} -> {peer}; log: tail -n 40 -F {shlex.quote(str(path))}",
++                flush=True,
++            )
++        while True:
++            if not errors.empty():
++                print(f"[launch] Cannot save/display rank log: {errors.get()}", flush=True)
++                return 1
++            done = True
++            for rank, proc in enumerate(processes):
++                code = proc.poll()
++                if code is None:
++                    done = False
++                    continue
++                if rank not in reported:
++                    print(f"[launch] rank{rank} exited (code={_exit_code(code)})", flush=True)
++                    reported.add(rank)
++                    if first_exit is None:
++                        first_exit = time.monotonic()
++                if code != 0:
++                    pumps[rank].join(timeout=2)
++                    path = root / f"rank{rank}.log"
++                    if path.exists():
++                        print(
++                            "\n".join(path.read_text(errors="replace").splitlines()[-20:]),
++                            flush=True,
++                        )
++                    return _exit_code(code)
++            if done:
++                for pump in pumps:
++                    pump.join(timeout=5)
++                if not errors.empty():
++                    print(f"[launch] Cannot save/display rank log: {errors.get()}", flush=True)
++                    return 1
++                return _print_summary(args, log_dir)
++            if first_exit is not None and time.monotonic() - first_exit > args.completion_timeout:
++                print(
++                    "[launch] A rank exited but peers did not finish; stopping remaining ranks",
++                    flush=True,
++                )
++                return 1
++            time.sleep(0.1)
+     except KeyboardInterrupt:
+-        print("\n[launch] interrupted; stopping peers...")
++        print("\n[launch] interrupted; stopping all ranks...", flush=True)
+         return 130
+     finally:
+-        for proc in peers:
+-            if proc.poll() is None:
+-                proc.terminate()
+-                try:
+-                    proc.wait(timeout=10)
+-                except subprocess.TimeoutExpired:
+-                    proc.kill()
++        for rank, proc in enumerate(processes):
++            if rank > 0 and proc.stdin is not None:
++                # EOF tells the worker to reap its whole group before SSH exits.
++                proc.stdin.close()
++                if proc.poll() is None:
++                    try:
++                        proc.wait(timeout=8)
++                    except subprocess.TimeoutExpired:
++                        pass
++            _stop_group(proc)
++        for pump in pumps:
++            pump.join(timeout=5)
++        for signum, handler in old_handlers.items():
++            signal.signal(signum, handler)
++
++
++def _print_summary(args: argparse.Namespace, log_dir: str) -> int:
++    path = Path(log_dir) / "run_summary.json"
++    try:
++        data = json.loads(path.read_text())
++        if data.get("status") != "completed" or data.get("algo") != args.algo:
++            raise ValueError("Missing completed summary for this algorithm")
++        world_size = data.get("world_size")
++        if world_size is None and args.algo != "ppo":
++            dp_sync = data.get("runtime_manifest", {}).get("dp_sync") or {}
++            world_size = dp_sync.get("world_size", 1)
++        if world_size != args.num_nodes:
++            raise ValueError("Summary world_size does not match launch")
++    except (OSError, ValueError) as exc:
++        print(f"[launch] Final statistics unavailable or incomplete: {exc}", flush=True)
++        return 1
++    fields = [
++        "status",
++        "num_envs_per_rank",
++        "global_num_envs",
++        "training_wall_time_sec",
++        "wall_time_sec",
++        "training_throughput_env_steps_per_sec",
++        "run_env_steps",
++        "final_mean_reward",
++        "mean_episode_length",
++        "last_checkpoint",
++    ]
++    print("[launch] Final statistics:", flush=True)
++    print(f"  world_size: {world_size}", flush=True)
++    completed = data.get("completed_iterations")
++    if isinstance(completed, int) and args.algo == "ppo":
++        completed += 1
++    print(f"  completed_iterations (count): {completed}", flush=True)
++    for field in fields:
++        if field in data:
++            print(f"  {field}: {data[field]}", flush=True)
++    if args.algo != "ppo":
++        for field in (
++            "final_env_steps_per_sec",
++            "final_learner_replay_rows_per_sec",
++            "final_cycle_wall_ms",
++        ):
++            if field in data:
++                print(f"  {field} (final iteration): {data[field]}", flush=True)
++    print(f"  summary: {path}", flush=True)
++    return 0
+ 
+ 
+ def main(argv: Sequence[str] | None = None) -> int:
++    argv = list(sys.argv[1:] if argv is None else argv)
++    if len(argv) == 2 and argv[0] == "--worker-spec":
++        return _worker(argv[1])
+     args = _build_parser().parse_args(argv)
+     _validate(args)
+     log_dir = _log_dir(args)
+diff --git a/src/unilab/rl/console.py b/src/unilab/rl/console.py
+new file mode 100644
+index 00000000..25b2a9c2
+--- /dev/null
++++ b/src/unilab/rl/console.py
+@@ -0,0 +1,62 @@
++"""Rich presentation for the direct RSL-RL PPO integration.
++
++The upstream logger remains the owner of scalar writes, counters and buffers.
++Only its console rendering is adapted; uni_rl is not required.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import io
++import os
++import sys
++from typing import Any
++
++from rich.console import Console
++from rich.panel import Panel
++from rich.table import Table
++from rich.text import Text
++
++
++def install_rsl_rl_console(runner: Any) -> None:
++    """Use Rich on terminals; preserve upstream text when redirected or requested."""
++    mode = os.environ.get("UNILAB_PPO_CONSOLE", "auto")
++    terminal = sys.stdout.isatty() or os.environ.get("UNILAB_CONSOLE_TTY") == "1"
++    if mode == "legacy" or (mode == "auto" and not terminal):
++        return
++    if mode not in {"auto", "rich"}:
++        raise ValueError("UNILAB_PPO_CONSOLE must be auto, rich, or legacy")
++    original = runner.logger.log
++    console = Console(force_terminal=terminal, highlight=False)
++
++    def log(self: Any, *args: Any, **kwargs: Any) -> Any:
++        captured = io.StringIO()
++        # Call the original exactly once. TensorBoard/W&B and training counters
++        # are unchanged, including resume accounting and episode-buffer clearing.
++        with contextlib.redirect_stdout(captured):
++            result = original(*args, **kwargs)
++        text = Text.from_ansi(captured.getvalue()).plain
++        if not text.strip():
++            return result
++        table = Table.grid(padding=(0, 2))
++        table.add_column(style="cyan", justify="right")
++        table.add_column(style="bold green", overflow="fold")
++        title = "PPO training"
++        other = []
++        for line in text.splitlines():
++            line = line.strip()
++            if not line or set(line) <= {"#", "-"}:
++                continue
++            if line.startswith("Learning iteration"):
++                title = f"PPO | {line}"
++            elif ":" in line:
++                label, value = line.split(":", 1)
++                table.add_row(Text(label), Text(value.strip()))
++            else:
++                other.append(line)
++        console.print(Panel(table, title=title, border_style="blue", expand=False))
++        for line in other:
++            console.print(Text(line))
++        return result
++
++    runner.logger.log = log.__get__(runner.logger, type(runner.logger))
+diff --git a/src/unilab/scripts/train_rsl_rl.py b/src/unilab/scripts/train_rsl_rl.py
+index 2de7035e..e41bb17d 100644
+--- a/src/unilab/scripts/train_rsl_rl.py
++++ b/src/unilab/scripts/train_rsl_rl.py
+@@ -39,6 +39,7 @@ from unilab.rl import (
+     torchrun_ranks_are_colocated,
+     validate_dp_launchable,
+ )
++from unilab.rl.console import install_rsl_rl_console
+ from unilab.training import (
+     algo_config_dict,
+     apply_env_nan_guard,
+@@ -608,6 +609,7 @@ def main(cfg: DictConfig) -> None:
+                         ),
+                     )
+                     patch_rsl_rl_action_std_logging(runner)
++                    install_rsl_rl_console(runner)
+ 
+                     if cfg.algo.load_run != "-1":
+                         resume_path, _ = parse_checkpoint_path(cfg, root_dir=Path.cwd())
+diff --git a/tests/test_native_launcher_lifecycle.py b/tests/test_native_launcher_lifecycle.py
+new file mode 100644
+index 00000000..ba044eb8
+--- /dev/null
++++ b/tests/test_native_launcher_lifecycle.py
+@@ -0,0 +1,192 @@
++"""CPU-only regression coverage for real pipes and rank process lifetimes."""
++
++from __future__ import annotations
++
++import base64
++import json
++import os
++import shlex
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++from scripts import launch_distributed as launch
++
++
++def spec(command: list[str], root: Path) -> str:
++    return base64.b64encode(
++        json.dumps(
++            {
++                "cmd": command,
++                "env": {},
++                "rank": 1,
++                "log_dir": str(root),
++            }
++        ).encode()
++    ).decode()
++
++
++def wait_path(path: Path) -> None:
++    deadline = time.monotonic() + 5
++    while not path.exists():
++        assert time.monotonic() < deadline
++        time.sleep(0.05)
++
++
++@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups")
++def test_worker_disconnect_reaps_training_group(tmp_path: Path) -> None:
++    pidfile = tmp_path / "child.pid"
++    command = [
++        sys.executable,
++        "-u",
++        "-c",
++        f"import os,time; from pathlib import Path; Path({str(pidfile)!r}).write_text(str(os.getpid())); print('worker live',flush=True); time.sleep(60)",
++    ]
++    worker = subprocess.Popen(
++        [sys.executable, str(Path(launch.__file__)), "--worker-spec", spec(command, tmp_path)],
++        stdin=subprocess.PIPE,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++    )
++    try:
++        wait_path(pidfile)
++        pid = int(pidfile.read_text())
++        assert worker.stdin is not None
++        worker.stdin.close()
++        assert worker.wait(timeout=10) == 143
++        with pytest.raises(ProcessLookupError):
++            os.kill(pid, 0)
++        assert "worker live" in (tmp_path / "launcher/rank1.log").read_text()
++    finally:
++        if worker.poll() is None:
++            worker.kill()
++
++
++def test_remote_command_quotes_paths_and_overrides() -> None:
++    args = launch._build_parser().parse_args(
++        [
++            "--algo",
++            "ppo",
++            "--task",
++            "go2_joystick_flat",
++            "-N",
++            "2",
++            "--peer",
++            "dgx2",
++            "--ifname",
++            "eth0",
++            "--master-ip",
++            "10.0.0.1",
++            "--remote-dir",
++            "/path with space/it's repo",
++            "algo.run_name=it's a test",
++        ]
++    )
++    tokens = shlex.split(launch._peer_ssh_command(args, 1, "logs/a b"))
++    assert tokens[1] == args.remote_dir
++    payload = json.loads(base64.b64decode(tokens[-1]))
++    assert payload["cmd"][-1] == "algo.run_name=it's a test"
++    assert payload["env"]["PYTHONUNBUFFERED"] == "1"
++
++
++@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups")
++@pytest.mark.parametrize("failing_rank,exit_code", [(0, 7), (1, 7), (1, 0)])
++def test_failure_stops_peer_and_reports_error(
++    tmp_path: Path, monkeypatch, capsys, failing_rank: int, exit_code: int
++) -> None:
++    fake_ssh = tmp_path / "ssh"
++    # Use a Python stand-in which executes the actual quoted remote command.
++    fake_ssh.write_text(
++        "#!"
++        + sys.executable
++        + "\nimport os,sys\nassert '-tt' not in sys.argv\nos.execvp('sh',['sh','-c',sys.argv[-1]])\n"
++    )
++    fake_ssh.chmod(0o755)
++    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
++    args = launch._build_parser().parse_args(
++        [
++            "--algo",
++            "sac",
++            "--task",
++            "g1_walk_flat",
++            "-N",
++            "2",
++            "--peer",
++            "fake",
++            "--ifname",
++            "eth0",
++            "--master-ip",
++            "10.0.0.1",
++        ]
++    )
++
++    args.completion_timeout = 0.2
++
++    def command(args, rank, log_dir, python):
++        if rank == failing_rank:
++            code = f"import time; time.sleep(0.3); print('injected rank failure',flush=True); raise SystemExit({exit_code})"
++        else:
++            code = f"import os,time; from pathlib import Path; Path({str(tmp_path / f'rank{rank}.pid')!r}).write_text(str(os.getpid())); time.sleep(60)"
++        return [sys.executable, "-u", "-c", code], {}
++
++    monkeypatch.setattr(launch, "_rank_command", command)
++
++    def remote(args, rank, log_dir):
++        cmd, _ = command(args, rank, log_dir, sys.executable)
++        return shlex.join(
++            [
++                sys.executable,
++                str(Path(launch.__file__)),
++                "--worker-spec",
++                spec(cmd, tmp_path / "remote"),
++            ]
++        )
++
++    monkeypatch.setattr(launch, "_peer_ssh_command", remote)
++    started = time.monotonic()
++    assert launch._launch_multi(args, str(tmp_path / "local")) == (exit_code or 1)
++    assert time.monotonic() - started < 12
++    pid = int((tmp_path / f"rank{1 - failing_rank}.pid").read_text())
++    with pytest.raises(ProcessLookupError):
++        os.kill(pid, 0)
++    output = capsys.readouterr().out
++    assert ("injected rank failure" if exit_code else "peers did not finish") in output
++    assert "Final statistics" not in output
++    assert (
++        "injected rank failure" in (tmp_path / f"local/launcher/rank{failing_rank}.log").read_text()
++    )
++
++
++@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups")
++def test_zero_exit_without_summary_is_failure(tmp_path, monkeypatch, capsys):
++    args = launch._build_parser().parse_args(["--algo", "ppo", "--task", "go2_joystick_flat"])
++    monkeypatch.setattr(launch, "_rank_command", lambda *args: ([sys.executable, "-c", "pass"], {}))
++    assert launch._launch_single(args, str(tmp_path / "run")) == 1
++    assert "Final statistics unavailable" in capsys.readouterr().out
++
++
++def test_old_run_directory_is_rejected(tmp_path):
++    (tmp_path / "model_0.pt").touch()
++    args = launch._build_parser().parse_args(["--algo", "ppo", "--task", "go2_joystick_flat"])
++    with pytest.raises(SystemExit, match="fresh"):
++        launch._launch_single(args, str(tmp_path))
++
++
++@pytest.mark.parametrize("algo", ["ppo", "sac", "flashsac"])
++def test_summary_uses_correct_iteration_and_world_size_fields(tmp_path, capsys, algo):
++    args = launch._build_parser().parse_args(["--algo", algo, "--task", "any", "-N", "2"])
++    data = {"status": "completed", "algo": algo, "completed_iterations": 1 if algo == "ppo" else 2}
++    if algo == "ppo":
++        data["world_size"] = 2
++    else:
++        data["runtime_manifest"] = {"dp_sync": {"world_size": 2}}
++        data["final_env_steps_per_sec"] = 123
++    (tmp_path / "run_summary.json").write_text(json.dumps(data))
++    assert launch._print_summary(args, str(tmp_path)) == 0
++    output = capsys.readouterr().out
++    assert "completed_iterations (count): 2" in output
++    assert "world_size: 2" in output
++    if algo != "ppo":
++        assert "final_env_steps_per_sec (final iteration): 123" in output
+diff --git a/tests/test_rsl_rl_console.py b/tests/test_rsl_rl_console.py
+new file mode 100644
+index 00000000..7128315e
+--- /dev/null
++++ b/tests/test_rsl_rl_console.py
+@@ -0,0 +1,93 @@
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++from unilab.rl.console import install_rsl_rl_console
++
++
++def test_rich_adapter_preserves_upstream_calls_and_metrics(monkeypatch, capsys):
++    monkeypatch.setenv("UNILAB_PPO_CONSOLE", "rich")
++    monkeypatch.setenv("UNILAB_CONSOLE_TTY", "0")
++    calls = []
++
++    def original(*args, **kwargs):
++        calls.append((args, kwargs))
++        print(
++            "########\nLearning iteration 2/10\n   Total steps: 1234\n   Mean reward: 2.50\n   ETA: 00:01:02\n"
++        )
++        return 42
++
++    runner = SimpleNamespace(logger=SimpleNamespace(log=original))
++    install_rsl_rl_console(runner)
++    assert runner.logger.log(2, action_std="unchanged") == 42
++    assert calls == [((2,), {"action_std": "unchanged"})]
++    output = capsys.readouterr().out
++    assert "PPO | Learning iteration 2/10" in output
++    assert "1234" in output and "2.50" in output and "00:01:02" in output
++    assert "########" not in output
++
++
++def test_legacy_mode_keeps_original_logger(monkeypatch):
++    monkeypatch.setenv("UNILAB_PPO_CONSOLE", "legacy")
++
++    def original():
++        return None
++
++    runner = SimpleNamespace(logger=SimpleNamespace(log=original))
++    install_rsl_rl_console(runner)
++    assert runner.logger.log is original
++
++
++def test_rich_adapter_keeps_real_rsl_rl_scalar_writes(monkeypatch, capsys):
++    import torch
++    from rsl_rl.utils.logger import Logger
++
++    monkeypatch.setenv("UNILAB_PPO_CONSOLE", "rich")
++    monkeypatch.setenv("UNILAB_CONSOLE_TTY", "0")
++
++    class Writer:
++        def __init__(self):
++            self.scalars = []
++
++        def add_scalar(self, *args):
++            self.scalars.append(args)
++
++    def logger():
++        item = Logger(
++            "unused",
++            {"num_steps_per_env": 4, "algorithm": {"rnd_cfg": None}},
++            {},
++            2,
++            False,
++            1,
++            0,
++            "cpu",
++        )
++        item.writer = Writer()
++        item.logger_type = "tensorboard"
++        item.rewbuffer.extend([1.0, 2.0])
++        item.lenbuffer.extend([3.0, 4.0])
++        item.ep_extras.append({"reward/test": torch.tensor([2.0])})
++        return item
++
++    plain, rich = logger(), logger()
++    runner = SimpleNamespace(logger=rich)
++    install_rsl_rl_console(runner)
++    kwargs = dict(
++        it=0,
++        start_it=0,
++        total_it=2,
++        collect_time=0.2,
++        learn_time=0.3,
++        loss_dict={"value": 0.5},
++        learning_rate=0.001,
++        action_std=torch.tensor([0.2]),
++        rnd_weight=None,
++    )
++    plain.log(**kwargs)
++    rich.log(**kwargs)
++    assert plain.writer.scalars == rich.writer.scalars
++    assert plain.tot_timesteps == rich.tot_timesteps == 8
++    assert plain.tot_time == rich.tot_time == 0.5
++    assert plain.ep_extras == rich.ep_extras == []
++    capsys.readouterr()

@@ -45,6 +45,21 @@ Timing breakdowns, quality metrics, baseline comparisons, and interpretation:
 - [`data/metrics_500_extracted.csv`](data/metrics_500_extracted.csv): full-precision extractor output.
 - [`data/metrics_500_per_iteration.csv`](data/metrics_500_per_iteration.csv): 8,000 per-iteration records.
 
+### What the speedup means
+
+The dual/single ratio measures **weak scaling within the optimized runtime**:
+every rank retains the single-node workload, so two nodes process twice the
+global workload per iteration. It is not the speedup of the optimization patch
+over the September code, or a measurement of time to a target reward.
+
+Compared with the September report, PPO **dual-node absolute throughput** changes
+by +2.39% (G1 walk), +4.07% (G1 flip), +0.93% (Go2), and -1.33% (Allegro).
+These one-run differences do not establish a statistically reliable improvement.
+Historical off-policy comparisons also change metric units, some workload
+settings, and the integrated runtime. The reported 1.9-3.8x historical iteration
+time ratios cannot be attributed entirely to RoCE or the DP optimization patch.
+See the [historical comparison audit](reports/historical_comparison_2026-10.md).
+
 ## Optimizations
 
 - Replace NCCL TCP with 200 Gb/s RoCE; retain P2P and SHM.
@@ -65,6 +80,12 @@ Timing breakdowns, quality metrics, baseline comparisons, and interpretation:
 | unilab-rl | `feat/dual-spark` pin `a3ed997d5c25ff708d674778782bc1be08a53e15` + tested main-runtime integration patch + optimization patch; experiment tree corresponds to commit `385a69f6d74bcfd9453bd2ed0c2d0687ae6c5556` |
 | PyTorch | `2.9.0+cu130` |
 | MuJoCo | `3.11.0` |
+
+The measured experiment tree is preserved separately from
+`UNILAB_RUNTIME_TREE` in `versions.env`. The current runtime additionally applies
+UniLab patch `0003`: native launcher lifecycle/logging fixes and terminal Rich
+presentation. Those fixes were validated with short functional runs, not a new
+500-iteration performance matrix. Exported benchmark data remains unchanged.
 
 The public branch pins and actual experiment trees are recorded separately.
 UniLab patches also include required off-policy logging fixes. The first
@@ -412,18 +433,40 @@ training, use the UniLab launcher to supply the per-rank distributed settings.
 
 ### Native-launcher output and statistics
 
-These native commands print full rank0 output. They do not apply this bundle's
-compact filter, fresh-directory preflight, per-rank `/tmp` logs, or exit markers.
-The pinned UniLab multi-node launcher suppresses peer stdout/stderr and returns
-rank0's exit status; use `run_one.sh` when you need both rank exit codes and
-separate live logs. Set a fresh timestamped run name for each native attempt.
+With UniLab patch `0003` applied **on both nodes**, these native commands print
+rank0 output and keep rank1 details in saved logs. PPO uses a Rich panel in an
+interactive terminal. Redirected output retains the upstream text format;
+`UNILAB_PPO_CONSOLE=rich` requests a panel without a terminal, and
+`UNILAB_PPO_CONSOLE=legacy` requests the original RSL-RL console format.
+The bundle launcher still defaults to compact output.
 
-To save rank0 output while preserving failures, run `set -o pipefail` and append
-`2>&1 | tee "/tmp/${run_name}_rank0_native.log"` to the selected command. View
-that file in another terminal with `tail -n 40 -F`.
+The native launcher automatically saves full stdout/stderr, including SSH errors:
 
-Native training still writes `logs/<run_name>/run_summary.json` on rank0. After
-a successful run, print the same final statistics as the bundle launcher:
+```bash
+# Both files are on HOST0; rank1 also saves a local copy on HOST1.
+tail -n 40 -F "logs/$run_name/launcher/rank0.log"
+tail -n 40 -F "logs/$run_name/launcher/rank1.log"
+# For a saved colored log, use less -R.
+```
+
+SSH uses `-T` and an isolated stdin pipe, preserving the coordinator's TTY.
+EOF on that pipe stops the remote rank process group. The launcher monitors
+every rank: a nonzero exit prints the error-log tail, stops the remaining ranks,
+and returns failure. Ctrl+C also stops the groups owned by this launch.
+After the first successful rank exit, remaining ranks have 60 seconds to finish;
+use `--completion-timeout 120` when checkpoint shutdown needs longer.
+Successful completion requires every rank to exit successfully and a completed,
+matching `run_summary.json`. Final statistics print automatically, including
+PPO full-training throughput or off-policy final-iteration throughput.
+These summary windows differ from the report's iterations 50-499.
+
+Use a fresh timestamped run name. A nonempty run directory is rejected.
+Updating the bundle alone does not update an existing runtime: re-run step 1
+with `UV_BIN=/home/nvidia/.local/bin/uv` after committing or preserving any local
+runtime changes. Bootstrap refuses dirty repositories and verifies the new
+`UNILAB_RUNTIME_TREE`. Do not apply `0003` repeatedly to a patched checkout.
+
+For additional expected-iteration validation, the bundle formatter remains available:
 
 ```bash
 # PPO dual-node example: expected iterations, world size, envs per rank, algo.
@@ -433,9 +476,8 @@ uv run --no-sync \
 ```
 
 Use world size `1` for single-node runs; select `sac` or `flashsac` for the other
-algorithms. The formatter is an optional convenience from this bundle; the
-training itself uses UniLab's entrypoints. For fixed-window throughput, use the
-extractor in step 4 with a manifest containing the new run name.
+algorithms. For fixed-window throughput, use the extractor in step 4 with a
+manifest containing the new run name.
 
 ## 4. Extract comparable absolute throughput
 

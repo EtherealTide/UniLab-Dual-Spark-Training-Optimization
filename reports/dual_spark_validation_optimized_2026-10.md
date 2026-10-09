@@ -2,6 +2,12 @@
 
 日期：2026-10-08
 
+> **Interpretation update (2026-10-09):** These are weak-scaling measurements of
+> the optimized configuration, not isolated optimization speedups over September.
+> Some historical off-policy units/configurations differ. One seed and 500
+> iterations establish observed throughput and short-run health, not convergence
+> equivalence. See the [historical comparison audit](historical_comparison_2026-10.md).
+
 目标：以与 2026-09 报告一致的任务矩阵和每节点满配口径，对优化后的
 PPO、SAC 和 FlashSAC 双 NVIDIA DGX Spark 训练进行 500 轮真实验证。
 
@@ -62,8 +68,8 @@ PPO、SAC 和 FlashSAC 双 NVIDIA DGX Spark 训练进行 500 轮真实验证。
 
 500 轮内全部负载均持续学习且无 NaN/Inf、rank 分歧或性能崩溃。SAC 和
 FlashSAC 的末段指标相近；PPO 的双机每轮处理两倍全局样本，G1 walk 已明显进入
-更晚学习阶段，G1 flip 仍存在阶段性差异。因此本表证明优化没有破坏训练，但不能
-替代 5000–10000 轮、多 seed 的最终收敛等价性结论。
+更晚学习阶段，G1 flip 仍存在阶段性差异。These observations do not establish
+convergence equivalence; repeated, longer matched runs are required.
 
 ---
 

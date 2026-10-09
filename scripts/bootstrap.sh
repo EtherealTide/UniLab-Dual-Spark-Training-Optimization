@@ -61,7 +61,7 @@ clone_if_missing "$UNILAB_REPO" "$target_root/UniLab"
 apply_pinned_patches \
     "$target_root/UniLab" \
     "$UNILAB_BRANCH_COMMIT" \
-    "$UNILAB_OPT_TREE" \
+    "${UNILAB_RUNTIME_TREE:-$UNILAB_OPT_TREE}" \
     "$bundle_root/patches/UniLab"
 
 clone_if_missing "$UNILAB_RL_REPO" "$target_root/unilab_rl"
