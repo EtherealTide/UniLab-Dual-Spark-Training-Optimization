@@ -246,35 +246,70 @@ when PPO single/dual policies enter different learning stages.
 
 ## 9. 复现
 
-FlashSAC 双机：
+These commands target the current bootstrapped runtime on `HOST0`
+(`spark-0a2a`). Launch once from HOST0; the native launcher starts rank1 on
+`nvidia@192.168.110.40`. Both nodes must have the patched runtime at the same
+path and passwordless SSH from HOST0 to HOST1. The original experiment path
+`/home/nvidia/unilab-dual-spark-opt-20261008/UniLab` is historical provenance,
+not the current reproduction installation path.
+
+Prepare the shell on HOST0:
 
 ```bash
-.venv/bin/python scripts/launch_distributed.py \
+cd /home/nvidia/unilab-dual-spark-repro/UniLab
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Run one workload at a time and choose a free rendezvous port. Use a new run
+directory for every attempt; the current launcher rejects nonempty directories.
+`--no-sync` preserves the pinned editable dependencies installed by bootstrap.
+`++training.log_interval=1` explicitly requests every-iteration metrics needed
+for the report's 50-499 extraction window.
+
+### FlashSAC: dual node
+
+```bash
+run_name="flashsac_dual_g1_walk_500_native_$(date +%Y%m%d_%H%M%S)"
+PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \
   --algo flashsac --task g1_walk_flat --sim mujoco \
-  --num-nodes 2 --peer <rank1-ssh-host> \
+  --num-nodes 2 --peer nvidia@192.168.110.40 \
   --master-ip 10.77.0.1 --ifname enp1s0f1np1 \
   --nccl-transport ib --nccl-ib-hca rocep1s0f1 \
-  --remote-dir /home/nvidia/unilab-dual-spark-opt-20261008/UniLab \
-  --dp-port 29702 --log-dir logs/flashsac_dual_g1_walk_500 \
+  --remote-dir /home/nvidia/unilab-dual-spark-repro/UniLab \
+  --dp-port 29702 --log-dir "logs/$run_name" \
   algo.num_envs=2048 algo.batch_size=8192 \
   algo.updates_per_step=8 algo.policy_frequency=4 \
-  algo.max_iterations=500
+  algo.max_iterations=500 ++training.log_interval=1
 ```
 
-PPO 双机：
+### PPO: dual node
 
 ```bash
-.venv/bin/python scripts/launch_distributed.py \
+run_name="ppo_dual_go2_500_native_$(date +%Y%m%d_%H%M%S)"
+PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \
   --algo ppo --task go2_joystick_flat --sim mujoco \
-  --num-nodes 2 --peer <rank1-ssh-host> \
+  --num-nodes 2 --peer nvidia@192.168.110.40 \
   --master-ip 10.77.0.1 --ifname enp1s0f1np1 \
   --nccl-transport ib --nccl-ib-hca rocep1s0f1 \
-  --remote-dir /home/nvidia/unilab-dual-spark-opt-20261008/UniLab \
-  --port 29705 --log-dir logs/ppo_dual_go2_500 \
-  algo.num_envs=2048 algo.max_iterations=500
+  --remote-dir /home/nvidia/unilab-dual-spark-repro/UniLab \
+  --port 29705 --log-dir "logs/$run_name" \
+  algo.num_envs=2048 algo.max_iterations=500 ++training.log_interval=1
 ```
 
-每个 run 使用独立 port 和 log directory。rank 0 是唯一 TensorBoard/checkpoint 写入者。
+For a functional smoke test, use `algo.max_iterations=2` and a fresh run name;
+smoke throughput is not a benchmark. Full rank logs are saved automatically:
+
+```bash
+# Run in another terminal on HOST0, replacing the name with the printed run name.
+tail -n 40 -F "logs/<run_name>/launcher/rank0.log"
+tail -n 40 -F "logs/<run_name>/launcher/rank1.log"
+```
+
+Rank0 is the only TensorBoard/checkpoint writer. Final statistics print after
+all ranks succeed and the completed summary is verified. Use the fixed-window
+extractor for report comparisons; update its manifest to the timestamped run
+name. The full-training PPO average and off-policy final-iteration statistics
+printed at completion are different estimators from the report tables.
 
 ## 10. 工程验证和结论
 
