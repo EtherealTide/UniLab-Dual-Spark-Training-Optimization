@@ -84,7 +84,9 @@ See the [historical comparison audit](reports/historical_comparison_2026-10.md).
 The measured experiment tree is preserved separately from
 `UNILAB_RUNTIME_TREE` in `versions.env`. The current runtime additionally applies
 UniLab patch `0003`: native launcher lifecycle/logging fixes and preservation
-of the existing loggers' terminal output. These fixes were validated with short functional runs, not a new
+of the existing loggers' terminal output. Patch `0004` selects the installed
+CUDA 13.0 Triton assembler on each host and forwards explicit assembler overrides
+to SSH workers. These fixes were validated with short functional runs, not a new
 500-iteration performance matrix. Exported benchmark data remains unchanged.
 
 The public branch pins and actual experiment trees are recorded separately.
@@ -351,6 +353,22 @@ uv run --no-sync scripts/launch_distributed.py --help
 the editable UniSim/unilab-rl installs. Running dependency synchronization again
 can replace them with the versions in UniLab's original lockfile.
 
+The native launcher and `run_one.sh` select
+`/usr/local/cuda-13.0/bin/ptxas` on each host when it is installed. Each rank
+prints its selected assembler. Triton 3.5.0's bundled CUDA 12.8 assembler cannot
+compile GB10 `sm_121a` kernels. An explicit `TRITON_PTXAS_PATH` takes precedence
+and is forwarded to both ranks; that absolute executable path must exist on
+both hosts. Invalid overrides fail before that rank starts training.
+
+For direct `train_sac.py`/`train_flashsac.py` commands, which bypass the
+launcher, set the assembler **in each host's shell** before starting Python:
+
+```bash
+export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
+test -x "$TRITON_PTXAS_PATH"
+"$TRITON_PTXAS_PATH" --version
+```
+
 ### Single-node PPO: native UniLab launcher
 
 ```bash
@@ -448,6 +466,7 @@ cd /home/nvidia/unilab-dual-spark-repro/UniLab
 export PATH="$HOME/.local/bin:$PATH"
 run_name="sac_dual_g1_walk_500_direct_trial1"
 rank=0  # HOST0; use rank=1 on HOST1
+export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
 NCCL_SOCKET_IFNAME=enp1s0f1np1 NCCL_IB_DISABLE=0 NCCL_IB_HCA=rocep1s0f1 \
@@ -540,7 +559,19 @@ Use a fresh timestamped run name. A nonempty run directory is rejected.
 Updating the bundle alone does not update an existing runtime: re-run step 1
 with `UV_BIN=/home/nvidia/.local/bin/uv` after committing or preserving any local
 runtime changes. Bootstrap refuses dirty repositories and verifies the new
-`UNILAB_RUNTIME_TREE`. Do not apply `0003` repeatedly to a patched checkout.
+`UNILAB_RUNTIME_TREE`. Do not reapply patches already present in a checkout.
+If both runtime checkouts match the previous tree
+`461fd30179165cde7f8dd3e1cd3447d0e75db358`, apply only the new assembler patch
+on each host, after checking for unrelated local changes:
+
+```bash
+git status --short
+git apply --check /home/nvidia/Desktop/UniLab-Dual-Spark-Training-Optimization/patches/UniLab/0004-cuda13-triton-assembler.patch
+git apply /home/nvidia/Desktop/UniLab-Dual-Spark-Training-Optimization/patches/UniLab/0004-cuda13-triton-assembler.patch
+```
+
+Update the bundle first so this patch exists. Stop active runs before changing
+their launcher. Direct entrypoints still need the environment setting above.
 
 For additional expected-iteration validation, the bundle formatter remains available:
 
@@ -587,6 +618,7 @@ unset UNILAB_DP_RENDEZVOUS_URL UNILAB_DP_LOG_DIR
 
 # Use GPU 0 and offscreen EGL rendering over SSH.
 export CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
 ```
 
 Select an existing checkpoint and the same algorithm, task, backend, and model
@@ -633,6 +665,36 @@ uv run --no-sync src/unilab/scripts/train_sac.py \
   training.play_render_mode=record training.play_env_num=1 training.play_steps=500 \
   training.export_onnx=false training.trace_enabled=false
 ```
+
+G1WalkFlat samples body-frame velocity commands: forward speed in
+`[-0.6, 1.0] m/s`, lateral speed in `[-0.4, 0.4] m/s`, and yaw rate in
+`[-0.8, 0.8] rad/s`, with a 20-second resampling interval. A 500-step recording
+lasts 10 seconds and can show the same backward/turning command throughout.
+Circling alone does not establish poor tracking. Playback samples a new command;
+it does not replay the training trajectory.
+
+To check forward walking, use the same checkpoint with a fixed `0.5 m/s`
+forward command and zero lateral/yaw commands. Rename an existing
+`play_video.mp4` first if you want to keep the random-command clip:
+
+```bash
+uv run --no-sync src/unilab/scripts/train_sac.py \
+  task=g1_walk_flat/mujoco "algo.load_run=$checkpoint" \
+  training.devices=null training.play_only=true training.no_play=false \
+  training.play_render_mode=record training.play_env_num=1 training.play_steps=500 \
+  training.export_onnx=false training.trace_enabled=false \
+  +env.seed=1 \
+  'env.commands.twist.ranges.lin_vel_x=[0.5,0.5]' \
+  'env.commands.twist.ranges.lin_vel_y=[0.0,0.0]' \
+  'env.commands.twist.ranges.ang_vel_z=[0.0,0.0]' \
+  'env.events.reset_root_state_uniform.params.pose_range.yaw=[0.0,0.0]'
+```
+
+These overrides change the evaluation commands, not the checkpoint weights.
+A short forward-walking clip is one test condition; assess policy quality using
+command-tracking errors, falls, and several seeds/speeds rather than total reward
+or a single clip. The published 500-iteration tables measure throughput, not
+converged gait quality.
 
 #### FlashSAC: G1 motion tracking
 
@@ -742,8 +804,10 @@ file must contain 500 `Perf/total_fps` samples; the extractor validates this.
   throughput includes state-distribution feedback.
 - NCCL uses `NET/IB`, but the experiments still use `GDR 0`; no driver/kernel
   module changes were made.
-- GB10 compute capability 12.1 can trigger Triton/PTXAS `sm_121a` autotune fallback
-  messages. Training can complete after cache warmup.
+- The original benchmark environment could emit Triton/PTXAS `sm_121a` autotune
+  compilation errors. Completing training does not prove every candidate kernel
+  compiled successfully. Patch `0004` and the updated bundle launcher select CUDA
+  13.0 `ptxas`; the historical throughput tables have not been rerun with this fix.
 
 ## Manual patch application
 

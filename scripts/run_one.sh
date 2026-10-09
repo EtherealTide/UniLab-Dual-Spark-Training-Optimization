@@ -7,6 +7,7 @@ cluster_file=${CLUSTER_FILE:-$bundle_root/config/cluster.env}
 iterations_override=${MAX_ITERATIONS:-}
 console_override=${CONSOLE_MODE:-}
 progress_override=${PROGRESS_INTERVAL:-}
+ptxas_override=${TRITON_PTXAS_PATH:-}
 
 if [[ $# -ne 6 ]]; then
     echo "usage: $0 <single|dual> <ppo|sac|flashsac> <task> <envs> <run_name> <port>" >&2
@@ -28,6 +29,7 @@ port=$6
 max_iterations=${iterations_override:-${MAX_ITERATIONS:-500}}
 console_mode=${console_override:-${CONSOLE_MODE:-compact}}
 progress_interval=${progress_override:-${PROGRESS_INTERVAL:-30}}
+ptxas_path=${ptxas_override:-${TRITON_PTXAS_PATH:-}}
 
 if [[ $console_mode != compact && $console_mode != full ]]; then
     echo "CONSOLE_MODE must be compact or full" >&2
@@ -111,12 +113,18 @@ fi
 
 run_rank() {
     local host=$1 label=$2 train_cmd=$3 log_file=$4
-    local remote_cmd quoted_cmd quoted_log rc
+    local remote_cmd quoted_cmd quoted_log rc compiler_setup
     printf -v quoted_log '%q' "$log_file"
+    compiler_setup=$(cat "$script_dir/ptxas_env.sh")
+    if [[ -n $ptxas_path ]]; then
+        local compiler_override
+        printf -v compiler_override 'export TRITON_PTXAS_PATH=%q; ' "$ptxas_path"
+        compiler_setup="$compiler_override$compiler_setup"
+    fi
     # pipefail preserves the training exit code rather than the exit code of tee.
     # Write an exit marker to each raw log, including normally quiet rank1.
-    printf -v remote_cmd 'set -o pipefail; cd %s || exit; %s 2>&1 | tee %s; rc=$?; printf "\n[launcher] %s exited (code=%%s)\n" "$rc" | tee -a %s; exit "$rc"' \
-        "$quoted_dir" "$train_cmd" "$quoted_log" "$label" "$quoted_log"
+    printf -v remote_cmd 'set -o pipefail; cd %s || exit; %s\n%s 2>&1 | tee %s; rc=$?; printf "\n[launcher] %s exited (code=%%s)\n" "$rc" | tee -a %s; exit "$rc"' \
+        "$quoted_dir" "$compiler_setup" "$train_cmd" "$quoted_log" "$label" "$quoted_log"
     printf -v quoted_cmd '%q' "$remote_cmd"
     if ssh -n "${ssh_options[@]}" "$host" "bash -c $quoted_cmd" 2>&1 |
         awk -v label="$label" -v mode="$console_mode" -v interval="$progress_interval" \

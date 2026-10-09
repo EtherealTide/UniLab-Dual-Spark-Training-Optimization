@@ -17,14 +17,26 @@ patch 重建正式实验代码。patch 使用 `git diff --binary` 生成，按�
   retains its original RSL-RL logger in the full saved log. PPO console forwarding
   defaults to compact progress with full-log `tail` hints and final statistics;
   `--ppo-console full` restores full console output. No algorithm changes.
-- Current runtime tree after patches 1-3:
-  `461fd30179165cde7f8dd3e1cd3447d0e75db358` (`UNILAB_RUNTIME_TREE`).
+- Runtime tree after patches 1-3:
+  `461fd30179165cde7f8dd3e1cd3447d0e75db358`.
 - Validation: 24 focused regression tests (including compact/full log integrity
   and progress throttling); a real two-Spark compact PPO run; existing MuJoCo PPO integration
   tests; a real two-Spark SAC run through a TTY with original Rich output; and a real SSH
   remote-path failure which prints the error and terminates rank0. No new
   500-iteration performance matrix was run for patch 3. Upstream full PR gates
   are still required before creating/updating a UniLab PR.
+- Patch 4: use the installed CUDA 13.0 Triton assembler on each Spark, forward
+  `TRITON_PTXAS_PATH` overrides to SSH workers, and reject invalid paths before
+  starting that rank. The bundled Triton 3.5.0 CUDA 12.8 assembler does not
+  recognize GB10 `sm_121a`. No dependency pins or algorithm settings changed.
+- Current runtime tree after patches 1-4:
+  `2705e28081a26689d1a25780022fda45b7c10d04` (`UNILAB_RUNTIME_TREE`).
+- Patch 4 validation: 30 native launcher regressions; isolated fresh-cache
+  `torch.compile` kernels on both GB10 GPUs matching eager output; and a real
+  12-iteration two-Spark SAC run with the original Rich panel, both ranks exiting
+  zero, and no PTXAS errors in either rank log. The bundle launcher has a matching
+  assembler fix, checked by 15 tests and five subtests. The benchmark tree and
+  exported performance data remain unchanged; no new performance matrix was run.
 
 ```bash
 git clone https://github.com/Motphys/UniLab.git
@@ -32,7 +44,7 @@ git -C UniLab checkout d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3
 git -C UniLab apply ../patches/UniLab/*.patch
 git -C UniLab add -A
 test "$(git -C UniLab write-tree)" = \
-  461fd30179165cde7f8dd3e1cd3447d0e75db358
+  2705e28081a26689d1a25780022fda45b7c10d04
 ```
 
 ## unilab-rl

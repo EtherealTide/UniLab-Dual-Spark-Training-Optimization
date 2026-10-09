@@ -1,0 +1,132 @@
+diff --git a/scripts/launch_distributed.py b/scripts/launch_distributed.py
+index 29ecfbcb..a7f947af 100755
+--- a/scripts/launch_distributed.py
++++ b/scripts/launch_distributed.py
+@@ -34,6 +34,7 @@ _ENTRYPOINT = {
+     "sac": "src/unilab/scripts/train_sac.py",
+     "flashsac": "src/unilab/scripts/train_flashsac.py",
+ }
++_SPARK_PTXAS = Path("/usr/local/cuda-13.0/bin/ptxas")
+ 
+ 
+ def _build_parser() -> argparse.ArgumentParser:
+@@ -200,6 +201,9 @@ def _rank_command(
+     python: str,
+ ) -> tuple[list[str], dict[str, str]]:
+     env = {"PYTHONUNBUFFERED": "1"}
++    if os.environ.get("TRITON_PTXAS_PATH"):
++        # SSH workers do not inherit the coordinator's environment.
++        env["TRITON_PTXAS_PATH"] = os.environ["TRITON_PTXAS_PATH"]
+     if args.num_nodes > 1:
+         env.update(_nccl_env(args))
+     if args.algo == "ppo" and args.num_nodes > 1:
+@@ -236,6 +240,23 @@ def _rank_command(
+     return cmd, env
+ 
+ 
++def _rank_environment(extra_env: dict[str, str], rank: int) -> dict[str, str]:
++    env = {**os.environ, **extra_env}
++    requested = env.get("TRITON_PTXAS_PATH")
++    if not requested and _SPARK_PTXAS.is_file() and os.access(_SPARK_PTXAS, os.X_OK):
++        # Triton 3.5 ships CUDA 12.8 ptxas, which cannot assemble GB10 sm_121a.
++        requested = str(_SPARK_PTXAS)
++    if requested:
++        path = Path(requested)
++        if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
++            raise SystemExit(
++                f"rank{rank}: TRITON_PTXAS_PATH must be an absolute executable path: {requested}"
++            )
++        env["TRITON_PTXAS_PATH"] = requested
++        print(f"[launch] rank{rank} Triton assembler: {requested}", flush=True)
++    return env
++
++
+ def _stop_group(proc: subprocess.Popen) -> None:
+     """Stop only the process group created for this rank, including collectors."""
+     try:
+@@ -390,6 +411,7 @@ def _start_local(cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
+ def _worker(encoded: str) -> int:
+     """Own a remote rank group; SSH stdin is a lease, never the user's TTY."""
+     spec = json.loads(base64.b64decode(encoded))
++    env = _rank_environment(spec["env"], spec["rank"])
+     path = Path(spec["log_dir"]) / "launcher" / f"rank{spec['rank']}.log"
+     if Path(spec["log_dir"]).exists() and any(Path(spec["log_dir"]).iterdir()):
+         raise SystemExit("Remote run directory is not empty; choose a fresh --log-dir")
+@@ -417,7 +439,7 @@ def _worker(encoded: str) -> int:
+     threading.Thread(target=watch_lease, daemon=True).start()
+     proc = subprocess.Popen(
+         spec["cmd"],
+-        env={**os.environ, **spec["env"]},
++        env=env,
+         stdin=subprocess.DEVNULL,
+         stdout=subprocess.PIPE,
+         stderr=subprocess.STDOUT,
+@@ -477,7 +499,7 @@ def _launch_managed(args: argparse.Namespace, log_dir: str) -> int:
+ 
+     try:
+         cmd, extra_env = _rank_command(args, 0, log_dir, sys.executable)
+-        proc = _start_local(cmd, {**os.environ, **extra_env})
++        proc = _start_local(cmd, _rank_environment(extra_env, 0))
+         processes.append(proc)
+         print(
+             f"[launch] rank0 log: tail -n 40 -F {shlex.quote(str((root / 'rank0.log').resolve()))}",
+diff --git a/tests/test_launch_distributed.py b/tests/test_launch_distributed.py
+index e739e203..e22da1db 100644
+--- a/tests/test_launch_distributed.py
++++ b/tests/test_launch_distributed.py
+@@ -1,7 +1,10 @@
+ from __future__ import annotations
+ 
+-import pytest
++import base64
++import json
++import shlex
+ 
++import pytest
+ from scripts import launch_distributed
+ 
+ 
+@@ -54,3 +57,43 @@ def test_nccl_auto_transport_only_pins_socket_interface() -> None:
+     assert launch_distributed._nccl_env(_args("--nccl-transport", "auto")) == {
+         "NCCL_SOCKET_IFNAME": "enp1s0f1np1"
+     }
++
++
++def test_ptxas_override_reaches_ssh_worker(monkeypatch, tmp_path) -> None:
++    path = tmp_path / "custom CUDA" / "ptxas"
++    path.parent.mkdir()
++    path.touch(mode=0o755)
++    monkeypatch.setenv("TRITON_PTXAS_PATH", str(path))
++    tokens = shlex.split(launch_distributed._peer_ssh_command(_args(), 1, "logs/probe"))
++    spec = json.loads(base64.b64decode(tokens[-1]))
++    assert spec["env"]["TRITON_PTXAS_PATH"] == str(path)
++    env = launch_distributed._rank_environment(spec["env"], 1)
++    assert env["TRITON_PTXAS_PATH"] == str(path)
++
++
++def test_rank_selects_installed_cuda13_assembler(monkeypatch, tmp_path) -> None:
++    path = tmp_path / "ptxas"
++    path.touch(mode=0o755)
++    monkeypatch.delenv("TRITON_PTXAS_PATH", raising=False)
++    monkeypatch.setattr(launch_distributed, "_SPARK_PTXAS", path)
++    assert launch_distributed._rank_environment({}, 1)["TRITON_PTXAS_PATH"] == str(path)
++
++
++def test_explicit_ptxas_takes_precedence_over_autodetection(monkeypatch, tmp_path) -> None:
++    path = tmp_path / "ptxas"
++    path.touch(mode=0o755)
++    monkeypatch.setattr(launch_distributed, "_SPARK_PTXAS", tmp_path / "missing")
++    env = launch_distributed._rank_environment({"TRITON_PTXAS_PATH": str(path)}, 0)
++    assert env["TRITON_PTXAS_PATH"] == str(path)
++
++
++@pytest.mark.parametrize("path", ["relative/ptxas", "/missing/cuda/ptxas"])
++def test_invalid_ptxas_override_fails_before_training(path) -> None:
++    with pytest.raises(SystemExit, match="absolute executable path"):
++        launch_distributed._rank_environment({"TRITON_PTXAS_PATH": path}, 1)
++
++
++def test_host_without_cuda13_keeps_triton_default(monkeypatch, tmp_path) -> None:
++    monkeypatch.delenv("TRITON_PTXAS_PATH", raising=False)
++    monkeypatch.setattr(launch_distributed, "_SPARK_PTXAS", tmp_path / "missing")
++    assert "TRITON_PTXAS_PATH" not in launch_distributed._rank_environment({}, 0)

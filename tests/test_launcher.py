@@ -53,6 +53,9 @@ algo = "flashsac" if any("train_flashsac.py" in a for a in sys.argv) else (
     "sac" if any("train_sac.py" in a for a in sys.argv) else "ppo")
 assert os.environ.get("PYTHONUNBUFFERED") == "1"
 assert settings["++training.log_interval"] == "1"
+if os.environ.get("EXPECTED_PTXAS"):
+    assert os.environ.get("TRITON_PTXAS_PATH") == os.environ["EXPECTED_PTXAS"]
+    print(f"mock assembler rank={rank}: {os.environ['TRITON_PTXAS_PATH']}", flush=True)
 print(f"mock start rank={rank}", flush=True)
 print("Actor Model: mock model details", flush=True)
 print(f"mock stderr rank={rank}", file=sys.stderr, flush=True)
@@ -237,6 +240,25 @@ class LauncherTests(unittest.TestCase):
         result = self.run_launcher("dual", FAKE_FAIL_RANK="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("rank1=7", result.stdout)
+        self.assertNotIn("DONE:", result.stdout)
+
+    def test_ptxas_override_reaches_both_training_ranks(self) -> None:
+        assembler = self.bin / "CUDA tools with spaces" / "ptxas"
+        assembler.parent.mkdir()
+        assembler.write_text("#!/bin/sh\nexit 0\n")
+        assembler.chmod(0o755)
+        result = self.run_launcher("dual", "sac", CONSOLE_MODE="full",
+                                   TRITON_PTXAS_PATH=str(assembler),
+                                   EXPECTED_PTXAS=str(assembler))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        for rank in (0, 1):
+            self.assertIn(f"mock assembler rank={rank}: {assembler}", result.stdout)
+
+    def test_invalid_ptxas_fails_before_training(self) -> None:
+        result = self.run_launcher(TRITON_PTXAS_PATH="/missing/cuda/ptxas")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("absolute executable path", result.stdout)
+        self.assertNotIn("mock start", result.stdout)
         self.assertNotIn("DONE:", result.stdout)
 
     def test_ssh_preflight_fails_before_either_rank_starts(self) -> None:
