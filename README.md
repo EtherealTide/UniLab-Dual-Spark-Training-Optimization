@@ -492,10 +492,27 @@ an isolated output PTY.
 
 With UniLab patch `0003` applied **on both nodes**, these native commands print
 rank0 output and keep rank1 details in saved logs. SAC/FlashSAC use their existing
-Rich Live panel and Training Summary in an interactive terminal. PPO retains
-the original RSL-RL logger. The launcher preserves rank0 TTY detection and width
+Rich Live panel and Training Summary in an interactive terminal. PPO defaults to
+a **compact console**: launch parameters, device/synchronization messages, the
+first iteration, progress at most every 30 seconds, and the final iteration.
+Full RSL-RL output is saved without filtering, and final statistics still print
+after every rank completes. The launcher prints an absolute, copyable
+`tail -n 40 -F ...` command for each rank's full log at startup.
+
+Optional native-launcher flags (PPO only):
+
+```bash
+--progress-interval 60   # Show periodic progress at most once per 60 seconds.
+--ppo-console full      # Print the original full RSL-RL stream to the terminal.
+```
+
+Append either option before the Hydra overrides in the launcher command.
+These flags filter only the launcher's console forwarding. A manual direct
+`train_rsl_rl.py` command continues to use the original RSL-RL console output;
+use the native launcher for automatic compact output and full log capture.
+The launcher preserves rank0 TTY detection and width
 using an isolated output PTY, without replacing logger metrics/layouts.
-Redirected output uses the original logger's non-terminal behavior.
+SAC/FlashSAC redirected output uses the original logger's non-terminal behavior.
 The bundle launcher still defaults to compact output.
 
 The native launcher automatically saves full stdout/stderr, including SSH errors:

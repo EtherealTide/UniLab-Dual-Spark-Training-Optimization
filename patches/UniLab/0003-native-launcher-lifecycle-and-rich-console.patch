@@ -1,8 +1,8 @@
 diff --git a/scripts/launch_distributed.py b/scripts/launch_distributed.py
-index 032aa616..956dd390 100755
+index 032aa616..29ecfbcb 100755
 --- a/scripts/launch_distributed.py
 +++ b/scripts/launch_distributed.py
-@@ -13,13 +13,21 @@ Two nodes:
+@@ -13,13 +13,22 @@ Two nodes:
  from __future__ import annotations
  
  import argparse
@@ -11,6 +11,7 @@ index 032aa616..956dd390 100755
 +import json
  import os
 +import queue
++import re
 +import shlex
 +import shutil
 +import signal
@@ -25,7 +26,7 @@ index 032aa616..956dd390 100755
  _ENTRYPOINT = {
      "ppo": "src/unilab/scripts/train_rsl_rl.py",
      "sac": "src/unilab/scripts/train_sac.py",
-@@ -34,19 +42,26 @@ def _build_parser() -> argparse.ArgumentParser:
+@@ -34,19 +43,26 @@ def _build_parser() -> argparse.ArgumentParser:
      parser.add_argument("--algo", required=True, choices=["ppo", "sac", "flashsac"])
      parser.add_argument("--task", required=True)
      parser.add_argument("--sim", default="mujoco")
@@ -60,12 +61,24 @@ index 032aa616..956dd390 100755
      cluster.add_argument(
          "--nccl-transport",
          choices=["tcp", "auto", "ib"],
-@@ -58,15 +73,30 @@ def _build_parser() -> argparse.ArgumentParser:
+@@ -58,15 +74,44 @@ def _build_parser() -> argparse.ArgumentParser:
          help="RDMA device for --nccl-transport=ib (for example rocep1s0f1)",
      )
      cluster.add_argument("--log-dir", default=None)
 -    cluster.add_argument("--remote-dir", default="~/ws/motphys/UniLab",
 -                         help="UniLab checkout path on peer hosts (default: ~/ws/motphys/UniLab)")
++    parser.add_argument(
++        "--ppo-console",
++        choices=["compact", "full"],
++        default="compact",
++        help="PPO console output; full rank logs are always saved (default: compact)",
++    )
++    parser.add_argument(
++        "--progress-interval",
++        type=float,
++        default=30,
++        help="Seconds between compact PPO progress lines (default: 30)",
++    )
 +    cluster.add_argument(
 +        "--completion-timeout",
 +        type=float,
@@ -85,6 +98,8 @@ index 032aa616..956dd390 100755
          raise SystemExit("error: --num-nodes must be >= 1")
 +    if args.completion_timeout <= 0:
 +        raise SystemExit("error: --completion-timeout must be positive")
++    if args.progress_interval <= 0:
++        raise SystemExit("error: --progress-interval must be positive")
 +    if any(value.lstrip("+").startswith("training.log_dir=") for value in args.overrides):
 +        raise SystemExit("error: use --log-dir rather than a training.log_dir override")
      if args.num_nodes == 1:
@@ -93,7 +108,7 @@ index 032aa616..956dd390 100755
          return
      missing = []
      if not args.ifname:
-@@ -79,8 +109,7 @@ def _validate(args: argparse.Namespace) -> None:
+@@ -79,8 +124,7 @@ def _validate(args: argparse.Namespace) -> None:
          missing.append("--nccl-ib-hca (required for --nccl-transport=ib)")
      if missing:
          raise SystemExit(
@@ -103,7 +118,7 @@ index 032aa616..956dd390 100755
          )
  
  
-@@ -100,9 +129,7 @@ def _hydra_args(args: argparse.Namespace, log_dir: str) -> list[str]:
+@@ -100,9 +144,7 @@ def _hydra_args(args: argparse.Namespace, log_dir: str) -> list[str]:
  
  
  def _launch_single(args: argparse.Namespace, log_dir: str) -> int:
@@ -114,7 +129,7 @@ index 032aa616..956dd390 100755
  
  
  def _nccl_env(args: argparse.Namespace) -> dict[str, str]:
-@@ -125,81 +152,414 @@ def _nccl_env(args: argparse.Namespace) -> dict[str, str]:
+@@ -125,81 +167,478 @@ def _nccl_env(args: argparse.Namespace) -> dict[str, str]:
  
  
  def _peer_ssh_command(args: argparse.Namespace, rank: int, log_dir: str) -> str:
@@ -171,11 +186,11 @@ index 032aa616..956dd390 100755
 -            start_new_session=True,
 -        ))
 +    return _launch_managed(args, log_dir)
++
  
 -    env = dict(os.environ)
 -    env.update(_nccl_env(args))
 -    if args.algo == "ppo":
-+
 +def _rank_command(
 +    args: argparse.Namespace,
 +    rank: int,
@@ -253,11 +268,61 @@ index 032aa616..956dd390 100755
 +    proc.wait()
 +
 +
++class _PpoConsole:
++    """Select brief console lines without modifying the original saved stream."""
++
++    def __init__(self, interval: float) -> None:
++        self.interval = interval
++        self.pending = b""
++        self.last_time: float | None = None
++        self.last_progress: tuple[int, int] | None = None
++
++    def write(self, chunk: bytes) -> None:
++        self.pending += chunk
++        while b"\n" in self.pending:
++            line, self.pending = self.pending.split(b"\n", 1)
++            self._line(line)
++
++    def finish(self) -> None:
++        if self.pending:
++            self._line(self.pending)
++            self.pending = b""
++
++    def _line(self, line: bytes) -> None:
++        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line.decode(errors="replace"))
++        text = text.replace("\r", "").strip()
++        match = re.search(r"Learning iteration\s+(\d+)/(\d+)", text)
++        if match:
++            # RSL-RL reports zero-based indices, whereas this is a completed count.
++            completed, total = int(match[1]) + 1, int(match[2])
++            now = time.monotonic()
++            progress = (completed, total)
++            if progress != self.last_progress and (
++                self.last_time is None
++                or now - self.last_time >= self.interval
++                or completed == total
++            ):
++                print(f"[ppo] Iteration {completed}/{total}", flush=True)
++                self.last_time, self.last_progress = now, progress
++        elif any(
++            message in text
++            for message in (
++                "Using device:",
++                "Synchronizing parameters",
++                "Downloading",
++                "Downloaded directory",
++                "TensorBoard logging to:",
++            )
++        ):
++            print(f"[ppo] {text}", flush=True)
++
++
 +def _pump(
 +    proc: subprocess.Popen,
 +    path: Path,
 +    show: bool,
 +    errors: queue.SimpleQueue,
++    console_filter: _PpoConsole | None = None,
 +) -> threading.Thread:
 +    logfile = path.open("xb", buffering=0)
 +
@@ -277,8 +342,13 @@ index 032aa616..956dd390 100755
 +                    break
 +                logfile.write(chunk)
 +                if show:
-+                    sys.stdout.buffer.write(chunk)
-+                    sys.stdout.buffer.flush()
++                    if console_filter is not None:
++                        console_filter.write(chunk)
++                    else:
++                        sys.stdout.buffer.write(chunk)
++                        sys.stdout.buffer.flush()
++            if show and console_filter is not None:
++                console_filter.finish()
 +        except Exception as exc:
 +            errors.put(exc)
 +        finally:
@@ -424,10 +494,19 @@ index 032aa616..956dd390 100755
 +        cmd, extra_env = _rank_command(args, 0, log_dir, sys.executable)
 +        proc = _start_local(cmd, {**os.environ, **extra_env})
 +        processes.append(proc)
-+        pumps.append(_pump(proc, root / "rank0.log", True, errors))
 +        print(
-+            f"[launch] rank0 log: tail -n 40 -F {shlex.quote(str(root / 'rank0.log'))}", flush=True
++            f"[launch] rank0 log: tail -n 40 -F {shlex.quote(str((root / 'rank0.log').resolve()))}",
++            flush=True,
 +        )
++        console_filter = None
++        if args.algo == "ppo" and args.ppo_console == "compact":
++            print(
++                f"[launch] PPO compact console; progress every {args.progress_interval:g}s; "
++                "full training output is saved in the rank log",
++                flush=True,
++            )
++            console_filter = _PpoConsole(args.progress_interval)
++        pumps.append(_pump(proc, root / "rank0.log", True, errors, console_filter))
 +        for rank, peer in enumerate(args.peer, start=1):
 +            proc = subprocess.Popen(
 +                [
@@ -454,7 +533,7 @@ index 032aa616..956dd390 100755
 +            path = root / f"rank{rank}.log"
 +            pumps.append(_pump(proc, path, False, errors))
 +            print(
-+                f"[launch] rank{rank} -> {peer}; log: tail -n 40 -F {shlex.quote(str(path))}",
++                f"[launch] rank{rank} -> {peer}; log: tail -n 40 -F {shlex.quote(str(path.resolve()))}",
 +                flush=True,
 +            )
 +        while True:
@@ -588,10 +667,10 @@ index 032aa616..956dd390 100755
      log_dir = _log_dir(args)
 diff --git a/tests/test_native_launcher_lifecycle.py b/tests/test_native_launcher_lifecycle.py
 new file mode 100644
-index 00000000..bd5b8a95
+index 00000000..4b609995
 --- /dev/null
 +++ b/tests/test_native_launcher_lifecycle.py
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,300 @@
 +"""CPU-only regression coverage for real pipes and rank process lifetimes."""
 +
 +from __future__ import annotations
@@ -836,3 +915,59 @@ index 00000000..bd5b8a95
 +        assert b"\r\r\n" not in data
 +    finally:
 +        launch._stop_group(proc)
++
++
++def test_compact_ppo_console_handles_chunks_and_throttles_progress(monkeypatch, capsys):
++    now = [0.0]
++    monkeypatch.setattr(launch.time, "monotonic", lambda: now[0])
++    console = launch._PpoConsole(30)
++    stream = "\x1b[1mLearning iteration 0/5\x1b[0m\nLoss: 123\nUsing device: cuda:0\n"
++    for byte in stream.encode():
++        console.write(bytes([byte]))
++    now[0] = 29
++    console.write(b"Learning iteration 1/5\n")
++    now[0] = 30
++    console.write(b"Learning iteration 2/5\n")
++    now[0] = 31
++    console.write(b"Learning iteration 3/5\nLearning iteration 4/5\nLearning iteration 4/5")
++    console.finish()
++    assert capsys.readouterr().out.splitlines() == [
++        "[ppo] Iteration 1/5",
++        "[ppo] Using device: cuda:0",
++        "[ppo] Iteration 3/5",
++        "[ppo] Iteration 5/5",
++    ]
++
++
++@pytest.mark.parametrize("compact", [True, False])
++def test_console_filter_preserves_full_rank_log(tmp_path, capsys, compact):
++    import queue
++
++    raw = "Using device: cuda:0\n\x1b[1mLearning iteration 0/2\x1b[0m\nLoss: 123\nLearning iteration 1/2\n原始日志"
++    proc = subprocess.Popen(
++        [sys.executable, "-u", "-c", f"import sys; sys.stdout.buffer.write({raw.encode()!r})"],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++    )
++    errors = queue.SimpleQueue()
++    path = tmp_path / "rank0.log"
++    pump = launch._pump(proc, path, True, errors, launch._PpoConsole(30) if compact else None)
++    assert proc.wait(timeout=5) == 0
++    pump.join(timeout=5)
++    assert not pump.is_alive() and errors.empty()
++    assert path.read_bytes() == raw.encode()
++    output = capsys.readouterr().out
++    if compact:
++        assert "Iteration 1/2" in output and "Iteration 2/2" in output
++        assert "Loss:" not in output and "原始日志" not in output
++    else:
++        assert output == raw
++
++
++@pytest.mark.parametrize("interval", ["0", "-1"])
++def test_invalid_compact_progress_interval_is_rejected(interval):
++    args = launch._build_parser().parse_args(
++        ["--algo", "ppo", "--task", "any", "--progress-interval", interval]
++    )
++    with pytest.raises(SystemExit, match="progress-interval must be positive"):
++        launch._validate(args)

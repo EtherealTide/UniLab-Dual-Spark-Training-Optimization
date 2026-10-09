@@ -289,6 +289,13 @@ PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \
 
 ### PPO: dual node
 
+The native launcher defaults to compact PPO console output: startup parameters,
+first/final progress, and periodic progress every 30 seconds. It prints the
+full-log `tail -n 40 -F ...` command at startup and final statistics at completion.
+Full RSL-RL output is preserved in the rank logs. Add `--ppo-console full` to
+restore the full console stream, or `--progress-interval 60` for less frequent
+progress. SAC/FlashSAC retain their original Rich Live panel.
+
 ```bash
 run_name="ppo_dual_go2_500_native_$(date +%Y%m%d_%H%M%S)"
 PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \

@@ -14,10 +14,13 @@ patch 重建正式实验代码。patch 使用 `git diff --binary` 生成，按�
 - Benchmark tree after patches 1-2: `7c9e8bd42c384cf72e418c013af85152344464a6`.
 - Patch 3: post-benchmark native launcher TTY/lifecycle/logging fixes. An isolated
   rank0 output PTY preserves the existing SAC/FlashSAC Rich Live panel; PPO
-  retains its original RSL-RL logger. No custom logger or algorithm changes.
+  retains its original RSL-RL logger in the full saved log. PPO console forwarding
+  defaults to compact progress with full-log `tail` hints and final statistics;
+  `--ppo-console full` restores full console output. No algorithm changes.
 - Current runtime tree after patches 1-3:
-  `bfde7cf0e9be82156124c5d58e84df39ceb66674` (`UNILAB_RUNTIME_TREE`).
-- Validation: 19 focused regression tests; existing MuJoCo PPO integration
+  `461fd30179165cde7f8dd3e1cd3447d0e75db358` (`UNILAB_RUNTIME_TREE`).
+- Validation: 24 focused regression tests (including compact/full log integrity
+  and progress throttling); a real two-Spark compact PPO run; existing MuJoCo PPO integration
   tests; a real two-Spark SAC run through a TTY with original Rich output; and a real SSH
   remote-path failure which prints the error and terminates rank0. No new
   500-iteration performance matrix was run for patch 3. Upstream full PR gates
@@ -29,7 +32,7 @@ git -C UniLab checkout d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3
 git -C UniLab apply ../patches/UniLab/*.patch
 git -C UniLab add -A
 test "$(git -C UniLab write-tree)" = \
-  bfde7cf0e9be82156124c5d58e84df39ceb66674
+  461fd30179165cde7f8dd3e1cd3447d0e75db358
 ```
 
 ## unilab-rl
