@@ -7,7 +7,7 @@ bundle_root=$(cd -- "$script_dir/.." && pwd)
 source "$bundle_root/versions.env"
 
 target_root=${1:-/home/nvidia/unilab-dual-spark-repro}
-uv_bin=${UV_BIN:-uv}
+uv_bin=${UV_BIN:-/home/nvidia/.local/bin/uv}
 
 require_clean_repo() {
     local repo_dir=$1
