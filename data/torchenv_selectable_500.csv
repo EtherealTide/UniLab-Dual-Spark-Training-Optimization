@@ -1,5 +1,5 @@
 run_name,carrier,mode,algorithm,task,num_envs,batch_size,updates_per_step,actor_updates,completed_iterations,total_fps,learner_rows_per_s,reward_mean_last20,episode_length_mean_last20,status,notes
-ppo_single_cpu_g1_walk_flat_500,cpu,single,ppo,g1_walk_flat,2048,,,,,,,,,pending,not_yet_run
+ppo_single_cpu_g1_walk_flat_500,cpu,single,ppo,g1_walk_flat,2048,,,2,499,25212.835556,,1.724968,117.026999,complete,formal_500_iter50_499
 ppo_dual_cpu_g1_walk_flat_500,cpu,dual,ppo,g1_walk_flat,2048,,,,,,,,,pending,not_yet_run
 ppo_single_cpu_g1_flip_tracking_500,cpu,single,ppo,g1_flip_tracking,1024,,,,,,,,,pending,not_yet_run
 ppo_dual_cpu_g1_flip_tracking_500,cpu,dual,ppo,g1_flip_tracking,1024,,,,,,,,,pending,not_yet_run

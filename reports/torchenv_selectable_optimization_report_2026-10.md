@@ -52,6 +52,10 @@ Allegro CPU/GPU smoke 的第 2 轮分别约 572/339 steps/s；这两个数字仅
 `Perf/total_fps`，off-policy 另报 learner rows/s；质量取最后 20 个 iteration 的 reward
 与 episode length。这样即使单/双机出现不同 warm-up，也不会把启动开销混进主结果。
 
+首个已完整收集的正式项为 PPO `g1_walk_flat` CPU 单机：50–499 均值
+`25,212.835556 steps/s`，末 20 轮 reward/episode length 为 `1.724968/117.026999`。
+该行已写入 CSV；其余项仍保持 pending，直到日志实际包含 500 条吞吐样本。
+
 ## 5. 复现
 
 ```bash
