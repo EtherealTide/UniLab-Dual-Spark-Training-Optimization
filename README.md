@@ -1,114 +1,122 @@
 # UniLab Dual-Spark Training Optimization
 
-两台 NVIDIA DGX Spark（每机单卡、200 Gb/s QSFP 直连）上的 UniLab 多节点训练优化、
-完整 500 轮实验矩阵与可复现交付。覆盖 PPO、SAC、FlashSAC，以及 G1 locomotion / motion
-tracking、Go2 joystick 和 Allegro in-hand MuJoCo 任务。
+Multi-node UniLab training on two NVIDIA DGX Spark systems (one GB10 GPU per
+node, 200 Gb/s QSFP direct link), with a complete 500-iteration experiment matrix
+and a pinned reproduction bundle. Workloads include PPO, SAC, FlashSAC, G1
+locomotion/motion tracking, Go2 joystick, and Allegro in-hand MuJoCo tasks.
 
-## 结果先看：绝对吞吐
+## Results: absolute throughput
 
-以下均为真实训练，iteration 0–49 作为预热，报告 iteration 50–499 的均值。双机列是
-两台机器合计的全局吞吐，而不是单 rank 吞吐。
+All results are from real training. Iterations 0-49 are warmup; reported
+throughput is the mean over iterations 50-499. Dual-node throughput is the
+global total across both nodes, not throughput per rank.
 
-### PPO：全局环境步数/秒
+### PPO: global environment steps/s
 
-| 任务 | 每节点 env | 单机 steps/s | 双机总 steps/s | 加速比 |
+| Task | Environments per node | Single-node steps/s | Dual-node global steps/s | Speedup |
 | --- | ---: | ---: | ---: | ---: |
-| `g1_walk_flat` | 2,048 | 49,160.65 | **83,567.30** | 1.70× |
-| `g1_flip_tracking` | 1,024 | 22,861.84 | **43,038.46** | 1.88× |
-| `go2_joystick_flat` | 2,048 | 66,808.68 | **133,751.39** | 2.00× |
-| `allegro_inhand` | 16,384 | 42,643.60 | **91,439.72** | 2.14×* |
+| `g1_walk_flat` | 2,048 | 49,160.65 | **83,567.30** | 1.70x |
+| `g1_flip_tracking` | 1,024 | 22,861.84 | **43,038.46** | 1.88x |
+| `go2_joystick_flat` | 2,048 | 66,808.68 | **133,751.39** | 2.00x |
+| `allegro_inhand` | 16,384 | 42,643.60 | **91,439.72** | 2.14x* |
 
-\* Allegro 双机在 500 轮内进入了更晚的策略阶段，状态分布变化降低了 collection 时间；
-2.14×是端到端真实训练吞吐，不应解释为硬件本身的超线性扩展。
+\* Dual-node Allegro reached a later policy stage within 500 iterations. The
+changed state distribution reduced collection time. The 2.14x result is real
+end-to-end training throughput, not evidence of hardware-only superlinear scaling.
 
-### Off-policy：环境吞吐与 learner 吞吐
+### Off-policy: environment and learner throughput
 
-每 rank 使用 2,048 env、batch 8,192、每轮 8 次 critic 和 2 次 actor update。
+Each rank uses 2,048 environments, batch size 8,192, eight critic updates, and
+two actor updates per iteration.
 
-| 负载 | 单机 env steps/s | 双机总 env steps/s | 单机 learner rows/s | 双机总 learner rows/s |
+| Workload | Single-node env steps/s | Dual-node global env steps/s | Single-node learner rows/s | Dual-node global learner rows/s |
 | --- | ---: | ---: | ---: | ---: |
 | SAC `g1_walk_flat` | 38,496.57 | **64,022.10** | 1,231,354 | **2,041,779** |
 | SAC `g1_motion_tracking` | 28,471.35 | **51,320.66** | 910,271 | **1,638,196** |
 | FlashSAC `g1_walk_flat` | 8,742.86 | **16,474.44** | 279,748 | **526,023** |
 | FlashSAC `g1_motion_tracking` | 8,355.22 | **15,759.63** | 267,349 | **503,298** |
 
-完整分段时间、质量指标、旧版对照和结果解释见：
+Timing breakdowns, quality metrics, baseline comparisons, and interpretation:
 
 - [`reports/dual_spark_validation_optimized_2026-10.md`](reports/dual_spark_validation_optimized_2026-10.md)
 - [`reports/dual_spark_optimization_2026-10.md`](reports/dual_spark_optimization_2026-10.md)
 - [`data/throughput_500.csv`](data/throughput_500.csv)
 - [`data/quality_500.csv`](data/quality_500.csv)
-- [`data/metrics_500_extracted.csv`](data/metrics_500_extracted.csv)（提取器原始精度汇总）
-- [`data/metrics_500_per_iteration.csv`](data/metrics_500_per_iteration.csv)（8,000 行逐轮数据）
+- [`data/metrics_500_extracted.csv`](data/metrics_500_extracted.csv): full-precision extractor output.
+- [`data/metrics_500_per_iteration.csv`](data/metrics_500_per_iteration.csv): 8,000 per-iteration records.
 
-## 优化内容
+## Optimizations
 
-- NCCL TCP 改为 200 Gb/s RoCE，保留 P2P/SHM；
-- FlashSAC whole-cycle CUDA Graph 内捕获 NCCL collective；
-- 持久 flat gradient bucket view，消除重复 pack/unpack；
-- SAC critic + alpha、FlashSAC actor + temperature 合并同步；
-- 默认负载 collective 分别从 18/12 次降到 10 次/iteration；
-- 用跨 rank finite-loss sentinel 保证 NaN/Inf 时 optimizer gate 一致。
+- Replace NCCL TCP with 200 Gb/s RoCE; retain P2P and SHM.
+- Capture NCCL collectives inside FlashSAC whole-cycle CUDA Graphs.
+- Use persistent flat gradient bucket views to remove repeated packing/unpacking.
+- Combine SAC critic + alpha synchronization and FlashSAC actor + temperature synchronization.
+- Reduce default collective counts from 18/12 to 10 per iteration.
+- Use a cross-rank finite-loss sentinel to keep optimizer gates consistent for NaN/Inf.
 
-## 精确版本锁定
+## Exact version pins
 
-版本的机器可读定义在 [`versions.env`](versions.env)。实验使用：
+[`versions.env`](versions.env) is the machine-readable source of version pins.
 
-| 项目 | 可复现版本 |
+| Component | Reproduction version |
 | --- | --- |
-| UniLab | `feat/dual-spark` pin `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` + 本仓库 patch；实验优化 tree 对应提交 `139524ac893efecf76feaf827e7236cb77307b33`；包版本 `1.3.2` |
-| UniSim | tag `v1.7.4`，commit `b48e91bbc62603299580a951c142a13c33bedae9`，包版本 `unisim-core==1.7.4` |
-| unilab-rl | `feat/dual-spark` pin `a3ed997d5c25ff708d674778782bc1be08a53e15` + 测试时 main runtime 集成 patch + 优化 patch；实验优化 tree 对应提交 `385a69f6d74bcfd9453bd2ed0c2d0687ae6c5556` |
+| UniLab | `feat/dual-spark` pin `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` + bundled patches; optimized experiment tree corresponds to commit `139524ac893efecf76feaf827e7236cb77307b33`; package `1.3.2` |
+| UniSim | tag `v1.7.4`, commit `b48e91bbc62603299580a951c142a13c33bedae9`; package `unisim-core==1.7.4` |
+| unilab-rl | `feat/dual-spark` pin `a3ed997d5c25ff708d674778782bc1be08a53e15` + tested main-runtime integration patch + optimization patch; experiment tree corresponds to commit `385a69f6d74bcfd9453bd2ed0c2d0687ae6c5556` |
 | PyTorch | `2.9.0+cu130` |
 | MuJoCo | `3.11.0` |
 
-这里明确区分“公开 `feat/dual-spark` 分支 pin”和“实际实验 tree”。UniLab patch 还包含
-实验需要的 off-policy logging 修复；unilab-rl 的第一份 patch 把公开分支集成到测试时
-使用的 main runtime tree，第二份才是本轮 DP/CUDA Graph 优化。每一步来源和最终 tree
-hash 都记录在 [`patches/README.md`](patches/README.md)，不会把本地实验提交误写成远端
-分支 HEAD。
+The public branch pins and actual experiment trees are recorded separately.
+UniLab patches also include required off-policy logging fixes. The first
+unilab-rl patch integrates the public branch with the tested main runtime; the
+second adds DP/CUDA Graph optimizations. Patch provenance and final tree hashes
+are documented in [`patches/README.md`](patches/README.md).
 
-## 仓库结构
+## Repository layout
 
 ```text
 .
 ├── README.md
-├── SHA256SUMS                    # 补丁、报告与原始导出数据校验
-├── versions.env                 # 唯一版本锁定入口
-├── config/cluster.env.example   # 双机地址、网卡和 HCA 示例
-├── data/                        # 500 轮汇总及逐 iteration 指标
-├── patches/                     # UniLab / unilab-rl 可应用补丁
-├── reports/                     # 优化后验证报告与详细优化报告
+├── SHA256SUMS                    # Patch, report, and exported-data checksums
+├── versions.env                 # Exact version pins
+├── config/cluster.env.example   # SSH hosts, rendezvous IP, network devices
+├── data/                        # Summary and per-iteration metrics
+├── patches/                     # UniLab / unilab-rl patches
+├── reports/                     # Validation and optimization reports
+├── tests/                       # Launcher and summary regression tests
 └── scripts/
-    ├── bootstrap.sh             # 克隆、打补丁、安装和版本校验
-    ├── run_one.sh               # 单项单机/双机 500 轮复现
-    ├── run_matrix.sh            # 完整 16-run 矩阵
-    └── extract_metrics.py       # TensorBoard 指标提取
+    ├── bootstrap.sh             # Clone, patch, install, verify
+    ├── run_one.sh               # Live single-/dual-node training launcher
+    ├── print_run_summary.py     # Final statistics and completion verification
+    ├── run_matrix.sh            # Full 16-run matrix
+    └── extract_metrics.py       # Fixed-window TensorBoard metrics
 ```
 
-## 环境前提
+## Prerequisites
 
-两台机器均需要：
+Both Spark nodes need Ubuntu aarch64, Python 3.12, `uv`, Git, Bash, the pinned
+PyTorch runtime, matching training-code paths and asset caches, and an active
+200 Gb/s interface/RoCE HCA (for example `enp1s0f1np1` / `rocep1s0f1`).
 
-- NVIDIA DGX Spark / GB10，Ubuntu aarch64；
-- Python 3.12、`uv`、Git；
-- PyTorch 2.9.0+cu130；
-- 200 Gb/s 直连接口，例如 `enp1s0f1np1`；
-- active RoCE HCA，例如 `rocep1s0f1`；
-- 相同代码路径和资产缓存；
-- 协调机可以无交互 SSH 到两台 Spark。
+The **coordinator** is whichever machine runs `scripts/run_one.sh` or
+`scripts/run_matrix.sh`. It can be `HOST0` (the master/rank0 Spark), `HOST1`, or a
+separate Linux machine. It needs passwordless SSH to every participating node.
+Even `single` mode uses SSH to `HOST0`, including when the coordinator is `HOST0`.
 
-先验证链路：
+Verify the direct link on the Spark nodes:
 
 ```bash
-ip -br link show enp1s0f1np1
+ip -br addr show enp1s0f1np1
 ibv_devinfo -d rocep1s0f1
 iperf3 -c <peer-200g-ip> -P 4
 ```
 
-## 1. 在两台 Spark 上安装精确版本
+Run one workload at a time when comparing throughput. Concurrent training,
+inference servers, or stalled distributed jobs can affect CPU/GPU availability.
 
-在每台 Spark 上执行：
+## 1. Install the pinned runtime on both Spark nodes
+
+Run on **each Spark**:
 
 ```bash
 git clone https://github.com/EtherealTide/UniLab-Dual-Spark-Training-Optimization.git
@@ -116,27 +124,24 @@ cd UniLab-Dual-Spark-Training-Optimization
 bash scripts/bootstrap.sh /home/nvidia/unilab-dual-spark-repro
 ```
 
-脚本会：
+The bootstrap script clones the three upstream repositories, checks out the
+base pins, applies bundled patches, verifies source trees, creates the frozen
+UniLab `.venv`, installs the pinned UniSim/unilab-rl sources, and checks package
+versions. It refuses to overwrite dirty repositories.
 
-1. 克隆三个上游仓库；
-2. checkout `versions.env` 中的 base commit；
-3. 对 UniLab 和 unilab-rl 应用本仓库 patch；
-4. checkout UniSim 1.7.4 对应 commit；
-5. 用 UniLab 的 frozen lock 创建 `.venv`；
-6. 用精确源码覆盖安装 UniSim 和 unilab-rl；
-7. 验证 tree hash 和包版本。
+The bundle directory (for example `~/Desktop/UniLab-Dual-Spark-Training-Optimization`)
+contains orchestration scripts and patches. The training runtime lives at
+`/home/nvidia/unilab-dual-spark-repro/UniLab`.
 
-脚本不会覆盖已有脏工作树；目录状态不符合预期时会直接失败。
+## 2. Configure the coordinator
 
-## 2. 配置集群
-
-在协调机复制配置：
+In the bundle checkout on the **machine that will launch the experiment**:
 
 ```bash
 cp config/cluster.env.example config/cluster.env
 ```
 
-修改至少以下字段：
+Edit these settings for your cluster:
 
 ```bash
 HOST0=nvidia@192.168.110.48
@@ -145,71 +150,186 @@ MASTER_ADDR=10.77.0.1
 NCCL_SOCKET_IFNAME=enp1s0f1np1
 NCCL_IB_HCA=rocep1s0f1
 REMOTE_ROOT=/home/nvidia/unilab-dual-spark-repro
+MAX_ITERATIONS=500
 ```
 
-## 3. 复现单项实验
+`HOST0`/`HOST1` are SSH destinations; `MASTER_ADDR` is the master node's IP on
+the direct training link. `REMOTE_ROOT` is an absolute path to the bootstrapped
+runtime, identical on both Spark nodes. Workers do not need `cluster.env` unless
+you also launch the orchestration script from them. Use `CLUSTER_FILE=/path/to/cluster.env`
+to select a different coordinator configuration.
 
-参数顺序为 `mode algo task envs run_name port`：
+### Configure passwordless SSH from the coordinator
+
+SSH access from your laptop to a Spark does not configure SSH from that Spark to
+itself or its peer. Run the following **on the coordinator**, adjusting hosts:
 
 ```bash
-# 单机 PPO，500 轮
-bash scripts/run_one.sh single ppo go2_joystick_flat 2048 \
-  ppo_single_go2_500 29705
+test -f ~/.ssh/id_ed25519 || \
+  ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+ssh-copy-id -i ~/.ssh/id_ed25519.pub nvidia@192.168.110.48
+ssh-copy-id -i ~/.ssh/id_ed25519.pub nvidia@192.168.110.40
 
-# 双机 PPO，500 轮
+ssh -o BatchMode=yes -o ConnectTimeout=10 nvidia@192.168.110.48 hostname
+ssh -o BatchMode=yes -o ConnectTimeout=10 nvidia@192.168.110.40 hostname
+```
+
+Both checks must return the expected hostname without a password prompt.
+The launcher respects `~/.ssh/config`, so SSH aliases such as `HOST0=dgx1` and
+`HOST1=dgx2`, custom ports, and `IdentityFile` settings work when configured on
+the coordinator. `BatchMode=yes` makes authentication failures explicit;
+`ConnectTimeout=10` bounds connection setup, not training duration.
+
+## 3. Launch an experiment with live output
+
+Argument order: `mode algo task envs run_name port`.
+
+```bash
+# Single-node PPO, 500 iterations (port is unused in single mode).
+bash scripts/run_one.sh single ppo go2_joystick_flat 2048 \
+  ppo_single_go2_500 0
+
+# Dual-node PPO: launch once from the coordinator, not once per Spark.
 bash scripts/run_one.sh dual ppo go2_joystick_flat 2048 \
   ppo_dual_go2_500 29705
 
-# 双机 SAC，固定 batch/update 口径
+# Dual-node SAC, fixed batch/update settings.
 bash scripts/run_one.sh dual sac g1_walk_flat 2048 \
   sac_dual_g1_walk_500 29700
 
-# 双机 FlashSAC
+# Dual-node FlashSAC.
 bash scripts/run_one.sh dual flashsac g1_motion_tracking 2048 \
   flashsac_dual_g1_motion_500 29703
 ```
 
-完整矩阵：
+Use a **new `run_name` for every attempt**, for example
+`ppo_single_go2_500_trial2`. Preflight checks SSH, the runtime Python executable,
+and the absence of an existing run directory on all participating nodes before
+launching training. This prevents stale summaries and mixed TensorBoard runs.
+
+For a short functional smoke test:
+
+```bash
+MAX_ITERATIONS=2 bash scripts/run_one.sh single ppo go2_joystick_flat 64 \
+  ppo_single_go2_smoke_trial1 0
+```
+
+An environment `MAX_ITERATIONS` override takes precedence over the config file.
+Smoke-test throughput is not a benchmark.
+
+### Console output and saved logs
+
+Python runs unbuffered, with `training.log_interval=1`. Output appears live with
+`[single]`, `[rank0]`, or `[rank1]` prefixes. NCCL/distributed initialization and
+compilation may take time before the first iteration; rank1 generally prints
+initialization messages while rank0 owns iteration metrics and checkpoints.
+
+The same output is saved using `tee` on the training nodes:
+
+| Mode | Node | Console log |
+| --- | --- | --- |
+| single | `HOST0` | `/tmp/<run_name>_single.log` |
+| dual | `HOST0` | `/tmp/<run_name>_rank0.log` |
+| dual | `HOST1` | `/tmp/<run_name>_rank1.log` |
+
+TensorBoard events, checkpoints, `run_config.json`, and `run_summary.json` live
+under `$REMOTE_ROOT/UniLab/logs/<run_name>` on `HOST0`. The formatter is sent over
+SSH stdin, so workers do not need an updated bundle checkout just to print stats.
+
+To view a saved log from another terminal on the corresponding Spark:
+
+```bash
+tail -n 40 -F /tmp/ppo_single_go2_500_single.log
+```
+
+This prints the last 40 lines and follows new lines. `Ctrl+C` in the `tail`
+terminal only stops the log viewer. `/tmp` logs may be removed on reboot.
+
+### Final statistics
+
+After every rank exits successfully, the launcher reads rank0's summary and prints:
+
+- Completion status and completed iterations as a count (PPO's stored index is zero-based).
+- World size, environments per rank, and global environment count.
+- Training wall time and runtime wall time including setup.
+- PPO global environment steps and full-training throughput.
+- SAC/FlashSAC final-iteration global environment and learner throughput, plus cycle time.
+- Final mean reward, mean episode length, checkpoint path, and summary path.
+
+Missing optional fields are shown as `N/A`. `DONE:<run_name>:0` is printed only
+after successful training and a matching completed summary. Training failures
+retain their nonzero exit status through the logging pipeline and print `FAILED`.
+If one distributed rank fails, its peer may remain in a collective until the
+runtime timeout; inspect both logs and stop the matching launchers on both nodes
+before retrying. Closing an SSH terminal is not a reliable cleanup method.
+
+The printed PPO full-training average and off-policy final-iteration rates use
+different windows from the tables above. Use the fixed-window extractor below
+for report comparisons.
+
+### Full matrix
 
 ```bash
 bash scripts/run_matrix.sh
 ```
 
-该脚本按顺序运行 8 个单机和 8 个双机任务，耗时较长。每个 run 使用独立日志目录；
-rank 0 是唯一 TensorBoard/checkpoint 写入者。
+The matrix runs eight single-node and eight dual-node workloads sequentially,
+with live output and final statistics for each. It uses fixed run names and is
+intended for a fresh logs directory; existing runs trigger the same preflight
+protection. Rank0 is the only TensorBoard/checkpoint writer.
 
-## 4. 提取绝对吞吐
+## 4. Extract comparable absolute throughput
+
+Run on `HOST0`, in the bundle checkout:
 
 ```bash
 source config/cluster.env
-$REMOTE_ROOT/UniLab/.venv/bin/python scripts/extract_metrics.py \
-  --root /home/nvidia/unilab-dual-spark-repro/UniLab/logs \
+"$REMOTE_ROOT/UniLab/.venv/bin/python" scripts/extract_metrics.py \
+  --root "$REMOTE_ROOT/UniLab/logs" \
   --manifest data/run_manifest.csv \
   --output metrics.csv
 ```
 
-若日志分布在两台机器，分别在对应机器运行提取器后合并 CSV。提取器固定使用：
+The manifest expects the standard 500-iteration run names. For custom names,
+copy and edit the manifest. If logs are spread across hosts, run extraction on
+each host using `--skip-missing` and merge the CSV outputs.
 
-- 性能：iteration 50–499；
-- 质量：末 20 条记录；
-- PPO：`Perf/total_fps`；
-- off-policy 环境吞吐：`Perf/total_fps`；
-- off-policy learner 吞吐：`world_size × batch_size × updates_per_step / iteration_time`。
+Extraction uses iterations 50-499 for performance and the last 20 records for
+quality. Environment throughput uses `Perf/total_fps`; off-policy learner
+throughput is `world_size * batch_size * updates_per_step / iteration_time`.
+PPO `completed_iterations=499` denotes the final zero-based index. The event
+file must contain 500 `Perf/total_fps` samples; the extractor validates this.
 
-PPO summary 中 `completed_iterations=499` 是 0-based 编号；事件文件应有 500 条
-`Perf/total_fps`，提取器会校验样本数。
+## Troubleshooting
 
-## 结果边界
+- **Missing `cluster.env`:** create it in the bundle checkout on the machine
+  executing the launcher, even if that machine is also the master.
+- **SSH authentication/host-key failure:** complete the coordinator SSH checks
+  before retrying. Single-node mode also requires SSH to `HOST0` itself.
+- **Existing run directory:** choose a new run name; do not mix repeated attempts.
+- **Rendezvous timeout:** verify both ranks launched, `MASTER_ADDR`, the selected
+  port, and direct-link reachability. A `single` run cannot pair with a dual rank1.
+- **Low throughput:** check `nvitop`/`nvidia-smi` for concurrent workloads. A live
+  process stuck in parameter synchronization is not a zombie; zombie status is
+  `Z` in `ps`. Stop the identified job's `torchrun` launchers with `SIGTERM` first;
+  use `SIGKILL` only for confirmed leftovers. Preserve unrelated jobs and desktop services.
+- **Old completed summary during a new run:** summaries are finalized at exit.
+  Follow the current console log; fresh run names prevent this ambiguity.
 
-- 500 轮足以验证吞吐和训练健康性，不等价于 5000–10000 轮、多 seed 的最终收敛结论；
-- Allegro 与 G1 walk 的单/双机在 500 轮内进入不同策略阶段，吞吐包含状态分布反馈；
-- NCCL 使用 `NET/IB`，但实验仍为 `GDR 0`；没有修改驱动或内核模块；
-- GB10 compute capability 12.1 会触发当前 Triton/PTXAS 的 `sm_121a` autotune 回退日志，
-  缓存命中后训练可正常完成。
+## Result boundaries
 
-## 补丁应用
+- 500 iterations validate throughput and training health, not final convergence
+  across multiple seeds and 5,000-10,000 iterations.
+- Allegro and G1 walk reach different policy stages in single-/dual-node runs;
+  throughput includes state-distribution feedback.
+- NCCL uses `NET/IB`, but the experiments still use `GDR 0`; no driver/kernel
+  module changes were made.
+- GB10 compute capability 12.1 can trigger Triton/PTXAS `sm_121a` autotune fallback
+  messages. Training can complete after cache warmup.
 
-如不使用 `bootstrap.sh`，可手工执行：
+## Manual patch application
+
+If you do not use `bootstrap.sh`:
 
 ```bash
 git clone https://github.com/Motphys/UniLab.git
@@ -221,4 +341,15 @@ git -C unilab_rl checkout a3ed997d5c25ff708d674778782bc1be08a53e15
 git -C unilab_rl apply ../patches/unilab_rl/*.patch
 ```
 
-详见 [`patches/README.md`](patches/README.md)。
+See [`patches/README.md`](patches/README.md) for provenance and tree checks.
+
+## Launcher regression tests
+
+On Linux, without SSH access or a GPU:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+These tests exercise live streaming, both rank labels, exit-code propagation,
+SSH preflight, stale-run protection, and PPO/SAC/FlashSAC summary counting.
