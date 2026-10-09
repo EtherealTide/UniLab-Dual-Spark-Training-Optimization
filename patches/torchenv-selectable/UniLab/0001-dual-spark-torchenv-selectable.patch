@@ -59926,10 +59926,10 @@ index 2983f4e6..6dd90c0e 100644
  
  def replace_generated_block(content: str, rendered_block: str) -> str:
 diff --git a/src/unilab/assets/hub.py b/src/unilab/assets/hub.py
-index c5665348..62dbf1b6 100644
+index c5665348..25a31c2a 100644
 --- a/src/unilab/assets/hub.py
 +++ b/src/unilab/assets/hub.py
-@@ -37,13 +37,11 @@ _HF_OFFICIAL_ENDPOINT = "https://huggingface.co"
+@@ -37,13 +37,16 @@ _HF_OFFICIAL_ENDPOINT = "https://huggingface.co"
  # label only feed the ``unilab-pull-assets`` summary line; resolution keys
  # off the marker file.
  ROBOT_ASSET_SPECS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
@@ -59940,10 +59940,15 @@ index c5665348..62dbf1b6 100644
      ),
      "go2": (("robots/go2/assets", "base_0.obj", "**/*", "asset"),),
 -    "x2": (("robots/x2/meshes", "pelvis.STL", "*.STL", "STL"),),
++    # Restored TorchEnv Allegro task assets share one tree with the hand meshes
++    # and the YCB tennis-ball texture/mesh.  Registering the directory here is
++    # required for clean checkouts; relying on a previous local cache would
++    # make the task non-reproducible.
++    "allegro_hand": (("robots/allegro_hand/assets", "base_link.stl", "**/*", "asset"),),
  }
  
  # Native SuperDex robots. When env.superdex_assets_root / SUPERDEX_ASSETS_PATH
-@@ -52,14 +50,7 @@ ROBOT_ASSET_SPECS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
+@@ -52,14 +55,7 @@ ROBOT_ASSET_SPECS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
  # HF robot repo into ASSETS_ROOT_PATH on first use, like every other robot
  # asset. Each entry lists the collision, render and license files that must
  # exist before physics construction.
@@ -59959,7 +59964,7 @@ index c5665348..62dbf1b6 100644
  
  
  def resolve_superdex_robot_asset(model_file: str, *, assets_root: str | None = None) -> str:
-@@ -326,7 +317,7 @@ def _resolve_snapshot_dir(
+@@ -326,7 +322,7 @@ def _resolve_snapshot_dir(
  
      Args:
          directory: ``ASSETS_ROOT_PATH``-relative directory path
@@ -59968,7 +59973,7 @@ index c5665348..62dbf1b6 100644
          repo_id: HF dataset repo to pull from.
          marker: A file inside the directory used to check completeness.
  
-@@ -402,9 +393,9 @@ def resolve_robot_asset_dir(directory: str, *, marker: str, show_progress: bool
+@@ -402,9 +398,9 @@ def resolve_robot_asset_dir(directory: str, *, marker: str, show_progress: bool
  
      Args:
          directory: ``ASSETS_ROOT_PATH``-relative directory path

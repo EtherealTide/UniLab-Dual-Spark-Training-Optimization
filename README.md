@@ -72,7 +72,7 @@ FlashSAC 的 MuJoCo 任务。
 
 | 项目 | 可复现版本 |
 | --- | --- |
-| UniLab | dual pin `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` + TorchEnv main source `5c8877ec6ec1bb0aba5c7682d6efdaed43fd49ee` 合并；集成提交 `d6634baaf0f3baaff4b03954d285746bb5988149`；包版本 `1.3.3` |
+| UniLab | dual pin `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` + TorchEnv main source `5c8877ec6ec1bb0aba5c7682d6efdaed43fd49ee` 合并；集成提交 `8ccb8902`；包版本 `1.3.3` |
 | UniSim | tag `v1.7.12`，commit `d082150631f16c8d3c8913281f62474cd9dffb93`，包版本 `unisim-core==1.7.12` |
 | unilab-rl | dual pin `a3ed997d5c25ff708d674778782bc1be08a53e15` + TorchEnv main source `8c5a322bac66d4e8150867f24913da3ab916dea3` 合并；集成提交 `a7f82c9476eaa61e97bf9ec6dd725f9a055ceb40`；包版本 `1.4.10` |
 | PyTorch | `2.14.0+cu130` |
