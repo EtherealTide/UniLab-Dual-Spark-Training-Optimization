@@ -12,8 +12,8 @@ fi
 # shellcheck disable=SC1090
 source "$cluster_file"
 
-if [[ $# -ne 6 ]]; then
-    echo "usage: $0 <single|dual> <ppo|sac|flashsac> <task> <envs> <run_name> <port>" >&2
+if [[ $# -lt 6 || $# -gt 7 ]]; then
+    echo "usage: $0 <single|dual> <ppo|sac|flashsac> <task> <envs> <run_name> <port> [cpu|cuda]" >&2
     exit 2
 fi
 
@@ -23,6 +23,7 @@ task=$3
 envs=$4
 run_name=$5
 port=$6
+env_device=${7:-${ENV_DEVICE:-cuda}}
 max_iterations=${MAX_ITERATIONS:-500}
 
 for value in "$mode" "$algo" "$task" "$envs" "$run_name" "$port"; do
@@ -39,10 +40,14 @@ if [[ $algo != ppo && $algo != sac && $algo != flashsac ]]; then
     echo "algo must be ppo, sac, or flashsac" >&2
     exit 2
 fi
+if [[ $env_device != cpu && $env_device != cuda ]]; then
+    echo "env_device must be cpu or cuda" >&2
+    exit 2
+fi
 
 remote_dir=$REMOTE_ROOT/UniLab
 python=.venv/bin/python
-common_args="task=$task/mujoco training.log_dir=logs/$run_name training.no_play=true algo.num_envs=$envs algo.max_iterations=$max_iterations"
+common_args="task=$task/mujoco training.log_dir=logs/$run_name training.no_play=true training.env_device=$env_device algo.num_envs=$envs algo.max_iterations=$max_iterations"
 
 if [[ $algo == ppo ]]; then
     entry=src/unilab/scripts/train_rsl_rl.py

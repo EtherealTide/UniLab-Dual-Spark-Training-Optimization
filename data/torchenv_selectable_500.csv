@@ -1,0 +1,17 @@
+run_name,carrier,mode,algorithm,task,num_envs,batch_size,updates_per_step,actor_updates,completed_iterations,total_fps,learner_rows_per_s,reward_mean_last20,episode_length_mean_last20,status,notes
+ppo_single_cpu_g1_walk_500,cpu,single,ppo,g1_walk_flat,2048,,,,499,pending,,,pending,not_yet_run
+ppo_dual_cpu_g1_walk_500,cpu,dual,ppo,g1_walk_flat,2048,,,,499,pending,,,pending,not_yet_run
+ppo_single_cuda_g1_walk_500,cuda,single,ppo,g1_walk_flat,2048,,,,499,pending,,,pending,not_yet_run
+ppo_dual_cuda_g1_walk_500,cuda,dual,ppo,g1_walk_flat,2048,,,,499,pending,,,pending,not_yet_run
+ppo_single_cpu_g1_flip_tracking_500,cpu,single,ppo,g1_flip_tracking,1024,,,,499,pending,,,pending,not_yet_run
+ppo_dual_cpu_g1_flip_tracking_500,cpu,dual,ppo,g1_flip_tracking,1024,,,,499,pending,,,pending,not_yet_run
+ppo_single_cuda_g1_flip_tracking_500,cuda,single,ppo,g1_flip_tracking,1024,,,,499,pending,,,pending,not_yet_run
+ppo_dual_cuda_g1_flip_tracking_500,cuda,dual,ppo,g1_flip_tracking,1024,,,,499,pending,,,pending,not_yet_run
+ppo_single_cpu_go2_joystick_flat_500,cpu,single,ppo,go2_joystick_flat,2048,,,,499,pending,,,pending,not_yet_run
+ppo_dual_cpu_go2_joystick_flat_500,cpu,dual,ppo,go2_joystick_flat,2048,,,,499,pending,,,pending,not_yet_run
+ppo_single_cuda_go2_joystick_flat_500,cuda,single,ppo,go2_joystick_flat,2048,,,,499,pending,,,pending,not_yet_run
+ppo_dual_cuda_go2_joystick_flat_500,cuda,dual,ppo,go2_joystick_flat,2048,,,,499,pending,,,pending,not_yet_run
+ppo_single_cpu_allegro_inhand_500,cpu,single,ppo,allegro_inhand,16384,,,,499,pending,,,pending,not_yet_run
+ppo_dual_cpu_allegro_inhand_500,cpu,dual,ppo,allegro_inhand,16384,,,,499,pending,,,pending,not_yet_run
+ppo_single_cuda_allegro_inhand_500,cuda,single,ppo,allegro_inhand,16384,,,,499,pending,,,pending,not_yet_run
+ppo_dual_cuda_allegro_inhand_500,cuda,dual,ppo,allegro_inhand,16384,,,,499,pending,,,pending,not_yet_run

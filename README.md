@@ -1,22 +1,26 @@
 # UniLab Dual-Spark Training Optimization
 
 两台 NVIDIA DGX Spark（每机单卡、200 Gb/s QSFP 直连）上的 UniLab 多节点训练优化、
-TorchEnv 主线合入 dual-spark 后的集成、500 轮实验矩阵与可复现交付。覆盖 PPO、SAC、
-FlashSAC，以及当前主线仍保留的 G1 locomotion / motion tracking、Go2 joystick MuJoCo 任务。
+TorchEnv 主线能力移植到指定 dual-spark pin、CPU/GPU carrier 选择、500 轮实验矩阵与可复现交付。
+本修正版分支恢复并迁移旧矩阵中的 `g1_flip_tracking` 与 `allegro_inhand`，覆盖 PPO、SAC、
+FlashSAC 的 MuJoCo 任务。
+
+> `feat/torchenv-dual-spark` 是此前把 main 整体合入的历史 checkpoint；本分支才是当前
+> 以 `d2fef27e`/`a3ed997d` 为 dual-spark 基线、再选择性加入 TorchEnv 与任务迁移的交付线。
 
 ## 结果先看：绝对吞吐
 
 以下均为真实训练，iteration 0–49 作为预热，报告 iteration 50–499 的均值。双机列是
 两台机器合计的全局吞吐，而不是单 rank 吞吐。
 
-### PPO：全局环境步数/秒
+### PPO：全局环境步数/秒（历史 NumPy baseline）
 
 | 任务 | 每节点 env | 单机 steps/s | 双机总 steps/s | 加速比 |
 | --- | ---: | ---: | ---: | ---: |
 | `g1_walk_flat` | 2,048 | 49,160.65 | **83,567.30** | 1.70× |
 | `go2_joystick_flat` | 2,048 | 66,808.68 | **133,751.39** | 2.00× |
-`g1_flip_tracking` 和 `allegro_inhand` 已由 TorchEnv main 删除，不能在不恢复旧 Numpy
-owner 的前提下声称可比；它们在新报告中标记为 N/A。
+本表仅保留旧版 NumPy baseline；TorchEnv CPU/GPU 的新鲜 500 轮结果写入
+`data/torchenv_selectable_500.csv`，没有完成的项明确标记为 `pending`，不会用 smoke 数字填充。
 
 ### Off-policy：环境吞吐与 learner 吞吐
 
@@ -39,6 +43,18 @@ owner 的前提下声称可比；它们在新报告中标记为 N/A。
 - [`data/metrics_500_per_iteration.csv`](data/metrics_500_per_iteration.csv)（8,000 行逐轮数据）
 
 ## 优化内容
+
+### 本轮 TorchEnv 迁移
+
+- 基线严格从 UniLab `d2fef27e5a6786695cef58b57bc6fd8bbe84e7e3` 和 unilab-rl
+  `a3ed997d5c25ff708d674778782bc1be08a53e15` 开始；不把 main 的任务删除/新增当作基线变化。
+- `training.env_device=null|cpu|cuda|cuda:0` 路由 Manager tensors、obs、reward、reset RNG；
+  `cuda:1` 被拒绝，避免多节点 rank-local ordinal 歧义。
+- Allegro action/observation/reward/termination/reset terms 改为 Torch-native；reset 仍通过
+  UniSim 公共 transaction 边界提交，MuJoCo 物理保持 CPU-authoritative。
+- G1 motion/flip 的 MuJoCo owner 改用 `TensorMotionCommandCfg`，motion sampler 支持
+  `start/clip_start/uniform/adaptive/mixed`。
+- UniSim 依赖在 `pyproject.toml` 与 `uv.lock` 中固定为 `==1.7.12`。
 
 - NCCL TCP 改为 200 Gb/s RoCE，保留 P2P/SHM；
 - FlashSAC whole-cycle CUDA Graph 内捕获 NCCL collective；
@@ -146,7 +162,8 @@ REMOTE_ROOT=/home/nvidia/unilab-dual-spark-repro
 
 ## 3. 复现单项实验
 
-参数顺序为 `mode algo task envs run_name port`：
+参数顺序为 `mode algo task envs run_name port [cpu|cuda]`；不填 carrier 时使用
+`config/cluster.env` 的 `ENV_DEVICE`（默认 `cuda`）：
 
 ```bash
 # 单机 PPO，500 轮
@@ -163,7 +180,7 @@ bash scripts/run_one.sh dual sac g1_walk_flat 2048 \
 
 # 双机 FlashSAC
 bash scripts/run_one.sh dual flashsac g1_motion_tracking 2048 \
-  flashsac_dual_g1_motion_500 29703
+  flashsac_dual_g1_motion_500 29703 cuda
 ```
 
 完整矩阵：
@@ -172,7 +189,8 @@ bash scripts/run_one.sh dual flashsac g1_motion_tracking 2048 \
 bash scripts/run_matrix.sh
 ```
 
-该脚本按顺序运行 8 个单机和 8 个双机任务，耗时较长。每个 run 使用独立日志目录；
+该脚本按顺序运行 CPU/GPU 两种 carrier 下的完整任务矩阵，每个 carrier 为 16 个 run
+（8 个单机 + 8 个双机），耗时较长。每个 run 使用独立日志目录；
 rank 0 是唯一 TensorBoard/checkpoint 写入者。
 
 ## 4. 提取绝对吞吐
@@ -195,6 +213,9 @@ $REMOTE_ROOT/UniLab/.venv/bin/python scripts/extract_metrics.py \
 
 PPO summary 中 `completed_iterations=499` 是 0-based 编号；事件文件应有 500 条
 `Perf/total_fps`，提取器会校验样本数。
+
+每个 run 的 `run_config.json` 同时记录 `training.env_device`，因此 CPU/GPU 结果不会因
+日志目录命名或 shell 默认值混淆。
 
 ## 结果边界
 
