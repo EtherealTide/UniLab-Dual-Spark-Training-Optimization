@@ -50,7 +50,7 @@ if [[ ! $envs =~ ^[0-9]+$ || ! $port =~ ^[0-9]+$ || ! $max_iterations =~ ^[0-9]+
     exit 2
 fi
 
-remote_dir=$REMOTE_ROOT/UniLab
+remote_dir=${REMOTE_ROOT_OVERRIDE:-$REMOTE_ROOT}/UniLab
 python_cmd="$uv_bin run --no-sync python"
 common_args="task=$task/mujoco training.log_dir=logs/$run_name training.no_play=true training.env_device=$env_device algo.num_envs=$envs algo.max_iterations=$max_iterations"
 
