@@ -311,6 +311,132 @@ with compact progress and final statistics for each. It uses fixed run names and
 intended for a fresh logs directory; existing runs trigger the same preflight
 protection. Rank0 is the only TensorBoard/checkpoint writer.
 
+## 3A. Train directly from the UniLab checkout
+
+The commands below use the **bootstrapped UniLab runtime**, without this
+bundle's `run_one.sh`. Run them from `HOST0` (`spark-0a2a`), where rank0 runs
+locally. The UniLab launcher starts rank1 through SSH when `--num-nodes 2` is
+selected; run it once, not once per node. Both nodes still need the pinned,
+patched runtime and matching paths from step 1. These RoCE flags are provided by
+the bundled UniLab patch; a checkout of the unpatched branch pin is insufficient.
+
+```bash
+cd /home/nvidia/unilab-dual-spark-repro/UniLab
+export PATH="$HOME/.local/bin:$PATH"
+uv run --no-sync scripts/launch_distributed.py --help
+```
+
+`--no-sync` preserves the runtime already verified by `bootstrap.sh`, including
+the editable UniSim/unilab-rl installs. Running dependency synchronization again
+can replace them with the versions in UniLab's original lockfile.
+
+### Single-node PPO: native UniLab launcher
+
+```bash
+run_name="ppo_single_go2_500_native_$(date +%Y%m%d_%H%M%S)"
+PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \
+  --algo ppo --task go2_joystick_flat --sim mujoco \
+  --log-dir "logs/$run_name" \
+  algo.num_envs=2048 algo.max_iterations=500 ++training.log_interval=1
+```
+
+Single-node mode runs locally and does not need self-SSH or `cluster.env`.
+
+### Dual-node PPO: native UniLab launcher
+
+```bash
+run_name="ppo_dual_go2_500_native_$(date +%Y%m%d_%H%M%S)"
+PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \
+  --algo ppo --task go2_joystick_flat --sim mujoco \
+  --num-nodes 2 --peer nvidia@192.168.110.40 \
+  --remote-dir /home/nvidia/unilab-dual-spark-repro/UniLab \
+  --master-ip 10.77.0.1 --ifname enp1s0f1np1 --port 29705 \
+  --nccl-transport ib --nccl-ib-hca rocep1s0f1 \
+  --log-dir "logs/$run_name" \
+  algo.num_envs=2048 algo.max_iterations=500 ++training.log_interval=1
+```
+
+`--peer` is the worker's SSH destination; `--master-ip` is rank0's direct-link IP.
+Use a free rendezvous port. The launcher's default NCCL transport is TCP, so
+`--nccl-transport ib` and `--nccl-ib-hca` are required for this RoCE experiment.
+
+### Dual-node SAC and FlashSAC: native UniLab launcher
+
+```bash
+# SAC: use --dp-port for the off-policy rendezvous.
+run_name="sac_dual_g1_walk_500_native_$(date +%Y%m%d_%H%M%S)"
+PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \
+  --algo sac --task g1_walk_flat --sim mujoco \
+  --num-nodes 2 --peer nvidia@192.168.110.40 \
+  --remote-dir /home/nvidia/unilab-dual-spark-repro/UniLab \
+  --master-ip 10.77.0.1 --ifname enp1s0f1np1 --dp-port 29700 \
+  --nccl-transport ib --nccl-ib-hca rocep1s0f1 \
+  --log-dir "logs/$run_name" \
+  algo.num_envs=2048 algo.max_iterations=500 \
+  algo.batch_size=8192 algo.updates_per_step=8 algo.policy_frequency=4 \
+  ++training.log_interval=1
+
+# FlashSAC: a separate run name and rendezvous port.
+run_name="flashsac_dual_g1_motion_500_native_$(date +%Y%m%d_%H%M%S)"
+PYTHONUNBUFFERED=1 uv run --no-sync scripts/launch_distributed.py \
+  --algo flashsac --task g1_motion_tracking --sim mujoco \
+  --num-nodes 2 --peer nvidia@192.168.110.40 \
+  --remote-dir /home/nvidia/unilab-dual-spark-repro/UniLab \
+  --master-ip 10.77.0.1 --ifname enp1s0f1np1 --dp-port 29703 \
+  --nccl-transport ib --nccl-ib-hca rocep1s0f1 \
+  --log-dir "logs/$run_name" \
+  algo.num_envs=2048 algo.max_iterations=500 \
+  algo.batch_size=8192 algo.updates_per_step=8 algo.policy_frequency=4 \
+  ++training.log_interval=1
+```
+
+For single-node SAC/FlashSAC, omit the cluster options (`--num-nodes`, `--peer`,
+`--remote-dir`, `--master-ip`, `--ifname`, ports, and NCCL options). Keep the same
+algorithm-specific batch/update overrides.
+
+### Call the training entrypoint directly
+
+For a local single-node run, you can bypass the UniLab launcher as well:
+
+```bash
+run_name="ppo_single_go2_500_entry_$(date +%Y%m%d_%H%M%S)"
+PYTHONUNBUFFERED=1 uv run --no-sync src/unilab/scripts/train_rsl_rl.py \
+  task=go2_joystick_flat/mujoco training.log_dir="logs/$run_name" \
+  training.no_play=true ++training.log_interval=1 \
+  algo.num_envs=2048 algo.max_iterations=500
+```
+
+Use `src/unilab/scripts/train_sac.py` or `train_flashsac.py` for off-policy
+training, with the matching task and batch/update overrides above. For dual-node
+training, use the UniLab launcher to supply the per-rank distributed settings.
+
+### Native-launcher output and statistics
+
+These native commands print full rank0 output. They do not apply this bundle's
+compact filter, fresh-directory preflight, per-rank `/tmp` logs, or exit markers.
+The pinned UniLab multi-node launcher suppresses peer stdout/stderr and returns
+rank0's exit status; use `run_one.sh` when you need both rank exit codes and
+separate live logs. Set a fresh timestamped run name for each native attempt.
+
+To save rank0 output while preserving failures, run `set -o pipefail` and append
+`2>&1 | tee "/tmp/${run_name}_rank0_native.log"` to the selected command. View
+that file in another terminal with `tail -n 40 -F`.
+
+Native training still writes `logs/<run_name>/run_summary.json` on rank0. After
+a successful run, print the same final statistics as the bundle launcher:
+
+```bash
+# PPO dual-node example: expected iterations, world size, envs per rank, algo.
+uv run --no-sync \
+  /home/nvidia/Desktop/UniLab-Dual-Spark-Training-Optimization/scripts/print_run_summary.py \
+  "logs/$run_name/run_summary.json" 500 2 2048 ppo
+```
+
+Use world size `1` for single-node runs; select `sac` or `flashsac` for the other
+algorithms. The formatter is an optional convenience from this bundle; the
+training itself uses UniLab's entrypoints. For fixed-window throughput, use the
+extractor in step 4 with a manifest containing the new run name.
+
 ## 4. Extract comparable absolute throughput
 
 Run on `HOST0`, in the bundle checkout. Set `REMOTE_ROOT` to the path used for
